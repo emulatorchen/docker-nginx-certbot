@@ -118,6 +118,50 @@ usecase that may be further studied in the
 [Override `server_name`](./advanced_usage.md#override-server_name) section of
 the Advanced Usage document.
 
+`include` directives are followed while reading a file, exactly as Nginx itself
+does when it loads its configuration. This matters if you factor shared TLS
+settings out into a snippet, which is a common way to avoid repeating the same
+six lines in every server block:
+
+```
+server {
+    listen      443 ssl;
+    server_name yourdomain.org;
+    include     conf.d/snippets/ssl_yourdomain.inc;
+}
+```
+
+Here the certificate lives in the snippet and the domain name lives in the
+server block. Neither file contains both halves, so neither would yield a
+complete request on its own — the snippet has a certificate but no domains, and
+the server block has domains but no certificate. Because includes are resolved
+first, the two are seen together and the request is built correctly.
+
+Relative include paths resolve against the Nginx prefix, which is `/etc/nginx`.
+Since everything you put in `user_conf.d/` is symlinked into `conf.d/`, a snippet
+you mount at `user_conf.d/snippets/ssl_yourdomain.inc` is reachable as
+`conf.d/snippets/ssl_yourdomain.inc`, as above; an absolute path works too. Globs
+such as `include conf.d/snippets/*.inc;` are expanded, again matching Nginx.
+
+> **Name your snippets so they do not match `*.conf*`.** Anything matching that
+> pattern under `conf.d/` — or under `user_conf.d/`, which is the same file by
+> another name, since everything there is symlinked into `conf.d/` — is scanned
+> as a configuration file in its own right, and is therefore *not* inlined into
+> the files that include it. A snippet scanned alone has certificate references
+> but no `server_name`, which yields a certificate with no domains. `.inc` is a
+> good choice.
+
+That exclusion is deliberate, and it is also why an aggregating layout keeps
+working. If `00-main.conf` contains only `include conf.d/sites/*.conf;`, each
+site file is still parsed separately, exactly as before — so every site keeps its
+own certificate with its own domains. Were those inlined, all the certificates
+and all the domains would land in one bucket together and each certificate would
+be requested for every site's hostnames.
+
+Note that discovery still starts from the `*.conf*` files in `/etc/nginx/conf.d/`.
+A snippet is read because something includes it, not because it was found by the
+scan, so a snippet that nothing includes is not picked up.
+
 Furthermore, we support wildcard domain names, but that requires you to use an
 authenticator capable of DNS-01 challenges, and more info about that may be
 found in the [lego_providers.md](./lego_providers.md) document.

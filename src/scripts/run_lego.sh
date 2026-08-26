@@ -303,6 +303,14 @@ done < <(find -L /etc/nginx/conf.d/ -name "*.conf*" -type f -print0)
 for cert_name in "${!certificates[@]}"; do
     server_names=(${certificates["${cert_name}"]})
 
+    # A certificate with no domain names would invoke lego with no --domains at
+    # all, which fails with a message that says nothing about the cause. This
+    # happens when a config declares an ssl_certificate but no server_name.
+    if [ ${#server_names[@]} -eq 0 ]; then
+        error "No domain names found for the certificate '${cert_name}'; skipping it"
+        continue
+    fi
+
     # Determine key type from cert name.
     if [[ "${cert_name,,}" =~ (^|[-.])ecdsa([-.]|$) ]] || \
        [[ "${cert_name,,}" =~ (^|[-.])ecc([-.]|$) ]]; then

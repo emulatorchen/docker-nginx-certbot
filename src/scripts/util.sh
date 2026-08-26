@@ -83,6 +83,201 @@ is_ipv6() {
     [[ "${1,,}" =~ ^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$ ]]
 }
 
+# FORK: this function does not exist upstream. Do not overwrite this file from
+# upstream wholesale; see UPSTREAM_SYNC.md.
+#
+# Emit a configuration file with every 'include' directive replaced by the
+# contents of the file(s) it names, recursively, the way Nginx itself resolves
+# includes when it loads its configuration. Every parse_* function below reads
+# its input through here.
+#
+# Without this, a server block that keeps its 'ssl_certificate' lines in an
+# included snippet is invisible to certificate discovery: the snippet holds the
+# certificate but no 'server_name', while the file including it holds the
+# 'server_name' but no certificate, so neither half parses on its own. Splitting
+# vhosts into shared snippets is a common Nginx layout, and it silently disabled
+# renewal for every certificate declared that way.
+#
+# Relative include paths resolve against the Nginx prefix. Globs are expanded,
+# and a quoted path containing spaces resolves correctly. An include matching
+# nothing is skipped rather than fatal, since Nginx tolerates an empty glob and
+# a cosmetic config problem must not become a failed renewal.
+#
+# Where this deliberately differs from Nginx — all inherited from the line-based
+# parsing the parse_* functions have always used:
+#   - 'include' must begin the line; a directive sharing the line ahead of it is
+#     not seen.
+#   - the terminating ';' must be on the same line as the 'include'.
+#   - anything following that ';' on the same line is dropped with it.
+#
+# An include whose target certificate discovery ALREADY scans on its own is not
+# inlined. Everything matching '*.conf*' under the conf.d directory is parsed as
+# a configuration in its own right, so inlining it here would fuse its
+# certificates with this file's server names and vice versa — 'parse_config_file'
+# pairs every certificate in its input with every domain in it. An aggregating
+# layout such as 'include conf.d/sites/*.conf;' would then request every site's
+# hostnames on every site's certificate. Snippets are the case this function
+# exists for, and a snippet is precisely a file discovery does NOT scan alone.
+#
+# $1: Path to a Nginx configuration file.
+# $2: Current recursion depth (internal; callers omit it).
+# $3: ':'-separated paths already open in this chain (internal; callers omit it).
+nginx_config_stream() {
+    local conf_file="${1}"
+    local depth="${2:-0}"
+    local seen="${3:-}"
+    local max_depth="${NGINX_INCLUDE_MAX_DEPTH:-10}"
+
+    # A non-numeric value makes the comparison below fail with a usage error,
+    # and because it is an 'if' condition that reads as false — which would
+    # remove the recursion limit entirely and let a self-including file run the
+    # stack out and kill the renewal loop.
+    if ! [[ "${max_depth}" =~ ^[0-9]+$ ]]; then
+        warning "NGINX_INCLUDE_MAX_DEPTH='${max_depth}' is not a number; falling back to 10" >&2
+        max_depth=10
+    fi
+
+    # '-gt' rather than '-ge': the top-level file is depth 0, so a limit of 0
+    # must still read that file and simply follow none of its includes. With
+    # '-ge' a limit of 0 would emit nothing at all and every certificate would
+    # silently disappear.
+    if [ "${depth}" -gt "${max_depth}" ]; then
+        # stderr deliberately: this function's stdout IS the configuration every
+        # parse_* function reads, so a log line on stdout would be parsed as
+        # though it were configuration.
+        warning "Reached include depth limit at '${conf_file}'; not descending further" >&2
+        return 0
+    fi
+
+    if [ ! -r "${conf_file}" ]; then
+        # Absent is fine and silent: Nginx tolerates an include glob matching
+        # nothing, and so do we. Present but unreadable is a different thing —
+        # we run as root, so it means a broken mount or bad permissions, and
+        # staying quiet would hide every certificate declared inside it. sed
+        # used to report this itself before the parse_* functions read through
+        # this function.
+        if [ -e "${conf_file}" ]; then
+            warning "Cannot read '${conf_file}'; any certificate declared in it will be missed" >&2
+        fi
+        return 0
+    fi
+
+    # Refuse to re-open a file already open further up this chain. The depth
+    # limit alone bounds how DEEP we go, not how much work we do: a handful of
+    # files that glob-include each other multiply combinatorially and would keep
+    # the renewal loop busy indefinitely, requesting nothing and reporting
+    # nothing. Nginx rejects circular includes outright; we simply stop.
+    # No '--': busybox realpath, which is what the Alpine image ships, does not
+    # accept it and exits non-zero even when it printed the right answer — which
+    # would quietly reduce this to a literal string comparison on exactly the
+    # image where every conf.d entry is a symlink. Every path reaching here is
+    # absolute, so there is no leading-dash to guard against anyway.
+    local real_path
+    real_path="$(realpath "${conf_file}" 2>/dev/null)"
+    [ -n "${real_path}" ] || real_path="${conf_file}"
+    case ":${seen}:" in
+        *":${real_path}:"*)
+            warning "Include cycle reaching '${conf_file}'; not descending further" >&2
+            return 0
+            ;;
+    esac
+    seen="${seen:+${seen}:}${real_path}"
+
+    # Roots holding files certificate discovery scans on its own; see the header
+    # comment. Both spellings matter: 'symlink_user_configs' mirrors every
+    # user_conf.d file into conf.d, and discovery scans with 'find -L', so one
+    # file is reachable under two names. Excluding only the conf.d spelling
+    # would let 'include user_conf.d/sites/*.conf;' inline files that are also
+    # scanned standalone, which is the fusing this exclusion exists to prevent.
+    local nginx_prefix="${NGINX_PREFIX:-/etc/nginx}"
+    nginx_prefix="${nginx_prefix%/}"
+
+    # Every directory whose '*.conf*' files discovery scans on its own.
+    # '/etc/nginx/conf.d' is hardcoded in run_lego.sh, run_local_ca.sh and
+    # auto_enable_configs, so it is scanned whatever NGINX_PREFIX says; and
+    # everything under user_conf.d is symlinked into it, which makes one file
+    # reachable under two names. The prefix-derived pair is included as well so
+    # a relocated prefix is covered, and each root's resolved form because
+    # conf.d entries are symlinks and discovery follows them with 'find -L'.
+    local -a scanned_roots=()
+    local root resolved
+    for root in "${nginx_prefix}/conf.d" "${nginx_prefix}/user_conf.d" \
+                "/etc/nginx/conf.d" "/etc/nginx/user_conf.d"; do
+        scanned_roots+=("${root}")
+        resolved="$(realpath "${root}" 2>/dev/null)"
+        if [ -n "${resolved}" ] && [ "${resolved}" != "${root}" ]; then
+            scanned_roots+=("${resolved}")
+        fi
+    done
+
+    local line include_arg include_path include_base real_include skip_include
+    local -a matches
+    while IFS= read -r line || [ -n "${line}" ]; do
+        if [[ "${line}" =~ ^[[:space:]]*include[[:space:]]+([^\;]+)\; ]]; then
+            include_arg="${BASH_REMATCH[1]}"
+            # Trim trailing whitespace, then any surrounding quotes Nginx allows.
+            include_arg="${include_arg%"${include_arg##*[![:space:]]}"}"
+            include_arg="${include_arg#\"}"; include_arg="${include_arg%\"}"
+            include_arg="${include_arg#\'}"; include_arg="${include_arg%\'}"
+
+            # Relative paths resolve against the Nginx prefix. Use the
+            # normalised copy: a prefix written with a trailing slash would
+            # otherwise produce '/etc/nginx//conf.d/...', which no longer
+            # prefix-matches the exclusion roots computed below and would let an
+            # aggregating include through.
+            if [[ "${include_arg}" != /* ]]; then
+                include_arg="${nginx_prefix}/${include_arg}"
+            fi
+
+            # Expand the glob WITHOUT word splitting, so that a quoted path
+            # containing spaces still resolves. compgen -G prints one match per
+            # line, and prints nothing when the pattern matches no file.
+            matches=()
+            while IFS= read -r include_path; do
+                matches+=("${include_path}")
+            done < <(compgen -G "${include_arg}" 2>/dev/null)
+
+            # No glob match: the path may still name a file directly.
+            if [ "${#matches[@]}" -eq 0 ] && [ -f "${include_arg}" ]; then
+                matches=("${include_arg}")
+            fi
+
+            for include_path in "${matches[@]}"; do
+                if [ ! -f "${include_path}" ]; then
+                    continue
+                fi
+
+                # Leave anything discovery parses standalone to discovery. See
+                # the header comment: inlining it would pair its certificates
+                # with this file's domains and produce wrong SANs. Both the
+                # written path and its resolved form are checked, since the same
+                # file is reachable as itself and as a symlink under conf.d.
+                include_base="${include_path##*/}"
+                if [[ "${include_base}" == *.conf* ]]; then
+                    real_include="$(realpath "${include_path}" 2>/dev/null)"
+                    [ -n "${real_include}" ] || real_include="${include_path}"
+                    skip_include=0
+                    for root in "${scanned_roots[@]}"; do
+                        if [[ "${include_path}" == "${root}"/* ]] \
+                            || [[ "${real_include}" == "${root}"/* ]]; then
+                            skip_include=1
+                            break
+                        fi
+                    done
+                    if [ "${skip_include}" -eq 1 ]; then
+                        debug "Not inlining '${include_path}': discovery parses it separately" >&2
+                        continue
+                    fi
+                fi
+
+                nginx_config_stream "${include_path}" "$((depth + 1))" "${seen}"
+            done
+        else
+            printf '%s\n' "${line}"
+        fi
+    done < "${conf_file}"
+}
+
 # Find lines that contain 'ssl_certificate_key', and try to extract a name from
 # each of these file paths. Each keyfile must be stored at the default location
 # of /etc/letsencrypt/live/<cert_name>/privkey.pem, otherwise we ignore it since
@@ -90,7 +285,7 @@ is_ipv6() {
 #
 # $1: Path to a Nginx configuration file.
 parse_cert_names() {
-    sed -n -r -e 's&^\s*ssl_certificate_key\s+\/etc/letsencrypt/live/(.*)/privkey.pem;.*&\1&p' "$1" | xargs -n1 echo | uniq
+    nginx_config_stream "$1" | sed -n -r -e 's&^\s*ssl_certificate_key\s+\/etc/letsencrypt/live/(.*)/privkey.pem;.*&\1&p' | xargs -n1 echo | uniq
 }
 
 # Nginx will answer to any domain name that is written on the line which starts
@@ -117,35 +312,35 @@ parse_cert_names() {
 #
 # $1: Path to a Nginx configuration file.
 parse_server_names() {
-    sed -n -r -e 's&^\s*server_name\s+([^;]*);\s*#?(\s*(lego_domain|certbot_domain):[^[:space:]]+)?.*$&\2 \1 \2&p' "$1" | xargs -n1 echo
+    nginx_config_stream "$1" | sed -n -r -e 's&^\s*server_name\s+([^;]*);\s*#?(\s*(lego_domain|certbot_domain):[^[:space:]]+)?.*$&\2 \1 \2&p' | xargs -n1 echo
 }
 
 # Return all unique "ssl_certificate_key" file paths.
 #
 # $1: Path to a Nginx configuration file.
 parse_keyfiles() {
-    sed -n -r -e 's&^\s*ssl_certificate_key\s+(.*);.*&\1&p' "$1" | xargs -n1 echo | uniq
+    nginx_config_stream "$1" | sed -n -r -e 's&^\s*ssl_certificate_key\s+(.*);.*&\1&p' | xargs -n1 echo | uniq
 }
 
 # Return all unique "ssl_certificate" file paths.
 #
 # $1: Path to a Nginx configuration file.
 parse_fullchains() {
-    sed -n -r -e 's&^\s*ssl_certificate\s+(.*);.*&\1&p' "$1" | xargs -n1 echo | uniq
+    nginx_config_stream "$1" | sed -n -r -e 's&^\s*ssl_certificate\s+(.*);.*&\1&p' | xargs -n1 echo | uniq
 }
 
 # Return all unique "ssl_trusted_certificate" file paths.
 #
 # $1: Path to a Nginx configuration file.
 parse_chains() {
-    sed -n -r -e 's&^\s*ssl_trusted_certificate\s+(.*);.*&\1&p' "$1" | xargs -n1 echo | uniq
+    nginx_config_stream "$1" | sed -n -r -e 's&^\s*ssl_trusted_certificate\s+(.*);.*&\1&p' | xargs -n1 echo | uniq
 }
 
 # Return all unique "dhparam" file paths.
 #
 # $1: Path to a Nginx configuration file.
 parse_dhparams() {
-    sed -n -r -e 's&^\s*ssl_dhparam\s+(.*);.*&\1&p' "$1" | xargs -n1 echo | uniq
+    nginx_config_stream "$1" | sed -n -r -e 's&^\s*ssl_dhparam\s+(.*);.*&\1&p' | xargs -n1 echo | uniq
 }
 
 # Given a config file path, return 0 if all SSL related files exist (or there

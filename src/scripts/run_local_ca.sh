@@ -231,6 +231,13 @@ done < <(find -L /etc/nginx/conf.d/ -name "*.conf*" -type f -print0)
 for cert_name in "${!certificates[@]}"; do
     server_names=(${certificates["$cert_name"]})
 
+    # No domain names means there is nothing to put in the certificate; say so
+    # rather than generating an empty one.
+    if [ ${#server_names[@]} -eq 0 ]; then
+        error "No domain names found for the certificate '${cert_name}'; skipping it"
+        continue
+    fi
+
     # Assemble the list of domains to be included in the request.
     ip_count=0
     dns_count=0
