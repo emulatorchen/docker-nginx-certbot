@@ -227,6 +227,15 @@ while IFS= read -r -d $'\0' conf_file; do
     parse_config_file "${conf_file}" certificates
 done < <(find -L /etc/nginx/conf.d/ -name "*.conf*" -type f -print0)
 
+# FORK: not present upstream. Do not drop when syncing this file; see
+# UPSTREAM_SYNC.md.
+#
+# Certificates declared through LEGO_EXTRA_CERTS need a local-CA certificate
+# just as much as the discovered ones do. Without this, moving a certificate
+# from a dummy server block to LEGO_EXTRA_CERTS would silently stop it being
+# issued here, and whatever serves it would have no file to open.
+parse_extra_certs certificates
+
 # Iterate over each key and create a signed certificate for them.
 for cert_name in "${!certificates[@]}"; do
     server_names=(${certificates["$cert_name"]})

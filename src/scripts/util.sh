@@ -461,6 +461,143 @@ parse_config_file() {
     done
 }
 
+# FORK: this function does not exist upstream. Do not overwrite this file from
+# upstream wholesale; see UPSTREAM_SYNC.md.
+#
+# Add certificates that no Nginx server block references.
+#
+# Discovery is driven by the Nginx configuration, which is correct for every
+# certificate Nginx itself serves. It cannot see a certificate this container
+# obtains on behalf of something else — a separate TLS terminator sitting in
+# front of Nginx, or a service that reads the PEM files directly. Without a way
+# to declare those, the only available trick was to add a dummy server block
+# purely so discovery would trip over it: obscure, undocumented, and one tidy-up
+# away from silently ending renewal.
+#
+# Format — entries separated by ';', domains within an entry by ',':
+#   LEGO_EXTRA_CERTS="<cert_name>=<domain>[,<domain>...][;<cert_name>=...]"
+#
+# Example:
+#   LEGO_EXTRA_CERTS="edge=example.com,www.example.com;api=*.api.example.com"
+#
+# A cert_name follows exactly the same rules as one parsed out of a config file:
+# it becomes /etc/letsencrypt/live/<cert_name>/ and may carry a dns-<provider>
+# suffix to select credentials. An entry naming a certificate that was already
+# discovered from the Nginx config is merged into it, never duplicated, so
+# declaring one redundantly is harmless.
+#
+# A malformed entry is reported and skipped rather than fatal: one typo must not
+# stop every other certificate in the list from renewing.
+#
+# $1: An associative bash array that will contain cert_name => server_names
+#     (space-separated) after the call to this function.
+parse_extra_certs() {
+    local -n certs=${1}
+
+    if [ -z "${LEGO_EXTRA_CERTS:-}" ]; then
+        return 0
+    fi
+
+    local entries=() domains=() server_names=()
+    local entry cert_name domain_list domain raw
+
+    # 'read' stops at the first newline, so a value written across several lines
+    # would have everything after line one silently discarded — the worst
+    # possible failure for this feature, since a certificate that is never
+    # requested is only noticed when it expires. Fold newlines into spaces (and
+    # drop carriage returns, for values coming from a CRLF env file) so the
+    # multi-line form documented in advanced_usage.md genuinely works.
+    raw="${LEGO_EXTRA_CERTS//$'\r'/}"
+    raw="${raw//$'\n'/ }"
+
+    IFS=';' read -r -a entries <<< "${raw}"
+
+    for entry in "${entries[@]}"; do
+        # Trim surrounding whitespace, so the value may be written across
+        # multiple lines for readability.
+        entry="${entry#"${entry%%[![:space:]]*}"}"
+        entry="${entry%"${entry##*[![:space:]]}"}"
+        if [ -z "${entry}" ]; then
+            continue
+        fi
+
+        if [[ "${entry}" != *=* ]]; then
+            error "Ignoring LEGO_EXTRA_CERTS entry '${entry}': expected <cert_name>=<domains>"
+            continue
+        fi
+
+        cert_name="${entry%%=*}"
+        domain_list="${entry#*=}"
+        cert_name="${cert_name//[[:space:]]/}"
+
+        if [ -z "${cert_name}" ] || [ -z "${domain_list}" ]; then
+            error "Ignoring LEGO_EXTRA_CERTS entry '${entry}': empty certificate name or domain list"
+            continue
+        fi
+
+        # The name becomes a path component under /etc/letsencrypt/live/, so
+        # keep it to characters that cannot climb out of that directory. A name
+        # parsed from an Nginx config is not checked this way, but there the
+        # operator at least sees the full path they typed; here they see only a
+        # short name and would not expect it to be path-significant.
+        # Must begin with an alphanumeric, '_' or '-', which also rules out the
+        # names '.' and '..' that the character class alone would allow.
+        if ! [[ "${cert_name}" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
+            error "Ignoring LEGO_EXTRA_CERTS entry '${entry}': certificate name may only contain letters, digits, '.', '_' and '-', and may not begin with '.'"
+            continue
+        fi
+
+        server_names=()
+        IFS=',' read -r -a domains <<< "${domain_list}"
+        for domain in "${domains[@]}"; do
+            domain="${domain//[[:space:]]/}"
+            if [ -z "${domain}" ]; then
+                continue
+            fi
+            # Each domain must look like a host name, optionally a wildcard.
+            # This is what catches an entry accidentally welded onto its
+            # neighbour by a missing ';' at the end of a line — without it the
+            # two fuse into one nonsense domain and take a working certificate
+            # down with them.
+            if ! [[ "${domain}" =~ ^\*?[A-Za-z0-9._-]+$ ]]; then
+                error "Ignoring domain '${domain}' in LEGO_EXTRA_CERTS entry '${entry}': not a valid host name"
+                continue
+            fi
+            server_names+=("${domain}")
+        done
+
+        if [ ${#server_names[@]} -eq 0 ]; then
+            error "Ignoring LEGO_EXTRA_CERTS entry '${entry}': no usable domain names"
+            continue
+        fi
+
+        debug "Adding extra certificate '${cert_name}' for: ${server_names[*]}"
+
+        if ! [ ${certs["${cert_name}"]+_} ]; then
+            certs["${cert_name}"]=""
+        else
+            debug "Merging extra domains into already discovered '${cert_name}'"
+        fi
+
+        # Order-preserving merge that drops duplicates. Deliberately a plain
+        # bash loop rather than parse_config_file's 'echo | xargs | awk | tr':
+        # xargs interprets quotes and backslashes, so a stray quote there
+        # discards the whole list and a backslash silently rewrites a domain.
+        local existing merged=() known=" "
+        for existing in ${certs["${cert_name}"]}; do
+            case "${known}" in *" ${existing} "*) continue ;; esac
+            merged+=("${existing}")
+            known="${known}${existing} "
+        done
+        for domain in "${server_names[@]}"; do
+            case "${known}" in *" ${domain} "*) continue ;; esac
+            merged+=("${domain}")
+            known="${known}${domain} "
+        done
+        certs["${cert_name}"]="${merged[*]} "
+    done
+}
+
 # Creates symlinks from /etc/nginx/conf.d/ to all the files found inside
 # /etc/nginx/user_conf.d/. This will also remove broken links.
 symlink_user_configs() {

@@ -530,7 +530,22 @@ load "${SCRIPTS_DIR}/util.sh"
   [ ${#certificates[@]} -eq 0 ]
 }
 
+@test "parse_extra_certs rejects a certificate name that would escape the live directory" {
+  local -A certificates
+  LEGO_EXTRA_CERTS="../../evil=a.example.org;ok-cert=b.example.org" \
+    parse_extra_certs certificates 2>/dev/null
+  local -p certificates
 
+  [ ${#certificates[@]} -eq 1 ]
+  [ "${certificates[ok-cert]}" == "b.example.org " ]
+}
+
+@test "parse_extra_certs rejects a name containing a path separator" {
+  local -A certificates
+  LEGO_EXTRA_CERTS="sub/dir=a.example.org" parse_extra_certs certificates 2>/dev/null
+
+  [ ${#certificates[@]} -eq 0 ]
+}
 
 @test "an aggregating include does not fuse the sites it collects" {
   # 'parse_config_file' pairs every certificate in its input with every domain
@@ -640,6 +655,116 @@ load "${SCRIPTS_DIR}/util.sh"
 }
 
 
+# ---------------------------------------------------------------------------
+# parse_extra_certs - certificates no server block references
+#
+# Discovery is driven by the Nginx configuration, which cannot see a certificate
+# this container renews on behalf of something else (a TLS terminator in front,
+# or a service reading the PEM files directly). Declaring those explicitly
+# replaces the old trick of adding a dummy server block just to be noticed.
+# ---------------------------------------------------------------------------
+
+@test "parse_extra_certs does nothing when the variable is unset" {
+  local -A certificates
+  unset LEGO_EXTRA_CERTS
+  parse_extra_certs certificates
+
+  [ ${#certificates[@]} -eq 0 ]
+}
+
+@test "parse_extra_certs does nothing when the variable is empty" {
+  local -A certificates
+  LEGO_EXTRA_CERTS="" parse_extra_certs certificates
+
+  [ ${#certificates[@]} -eq 0 ]
+}
+
+@test "parse_extra_certs adds a single certificate" {
+  local -A certificates
+  LEGO_EXTRA_CERTS="edge-cert=example.org" parse_extra_certs certificates
+  local -p certificates
+
+  [ ${#certificates[@]} -eq 1 ]
+  [ "${certificates[edge-cert]}" == "example.org " ]
+}
+
+@test "parse_extra_certs adds multiple certificates with multiple domains" {
+  local -A certificates
+  LEGO_EXTRA_CERTS="edge-cert=example.org,www.example.org;api-cert.dns-route53=*.api.example.org" \
+    parse_extra_certs certificates
+  local -p certificates
+
+  [ ${#certificates[@]} -eq 2 ]
+
+  local edge=(${certificates[edge-cert]})
+  [ ${#edge[@]} -eq 2 ]
+  [ "${edge[0]}" == "example.org" ]
+  [ "${edge[1]}" == "www.example.org" ]
+
+  # A dns-<provider> suffix must survive untouched; it selects the credentials.
+  [ "${certificates[api-cert.dns-route53]}" == "*.api.example.org " ]
+}
+
+@test "parse_extra_certs merges into an already discovered certificate without duplicating" {
+  local -A certificates
+  parse_config_file "${FIXTURES_DIR}/nginx_config/single_files/single_server_single_cert_single_name.conf" certificates
+
+  # 'example.org' is already present; only the new name must be appended.
+  LEGO_EXTRA_CERTS="my-cert=example.org,extra.example.org" parse_extra_certs certificates
+  local -p certificates
+
+  [ ${#certificates[@]} -eq 1 ]
+  local server_names=(${certificates[my-cert]})
+  [ ${#server_names[@]} -eq 3 ]
+  [ "${server_names[0]}" == "example.org" ]
+  [ "${server_names[1]}" == "www.example.org" ]
+  [ "${server_names[2]}" == "extra.example.org" ]
+}
+
+@test "parse_extra_certs skips malformed entries but keeps the valid ones" {
+  local -A certificates
+  # In order: no '=', empty name, empty domain list, then a valid entry. One
+  # typo must not stop every other certificate in the list from renewing.
+  LEGO_EXTRA_CERTS="just-a-name;=example.org;empty-domains=;good-cert=good.example.org" \
+    parse_extra_certs certificates 2>/dev/null
+  local -p certificates
+
+  [ ${#certificates[@]} -eq 1 ]
+  [ "${certificates[good-cert]}" == "good.example.org " ]
+}
+
+@test "parse_extra_certs handles a value written across multiple lines" {
+  # 'read' stops at the first newline. A multi-line value must not silently lose
+  # every entry after line one: a certificate that is never requested is only
+  # noticed when it expires, which is the failure this feature exists to prevent.
+  local -A certificates
+  LEGO_EXTRA_CERTS=$'edge-cert=example.org,www.example.org;\napi-cert=api.example.org;\nlegacy-cert=old.example.org' \
+    parse_extra_certs certificates
+  local -p certificates
+
+  [ ${#certificates[@]} -eq 3 ]
+  [ -n "${certificates[edge-cert]}" ]
+  [ "${certificates[api-cert]}" == "api.example.org " ]
+  [ "${certificates[legacy-cert]}" == "old.example.org " ]
+
+  local edge=(${certificates[edge-cert]})
+  [ ${#edge[@]} -eq 2 ]
+  [ "${edge[0]}" == "example.org" ]
+  [ "${edge[1]}" == "www.example.org" ]
+}
+
+@test "parse_extra_certs handles a value with carriage returns" {
+  # Values sourced from a CRLF env file must not gain a stray \r in the domain.
+  local -A certificates
+  LEGO_EXTRA_CERTS=$'edge-cert=example.org;\r\napi-cert=api.example.org' \
+    parse_extra_certs certificates
+  local -p certificates
+
+  [ ${#certificates[@]} -eq 2 ]
+  [ "${certificates[edge-cert]}" == "example.org " ]
+  [ "${certificates[api-cert]}" == "api.example.org " ]
+}
+
 @test "nginx_config_stream is silent about a file that does not exist" {
   # An include matching nothing is normal and Nginx tolerates it, so this must
   # not produce output on stdout, where it would be parsed as configuration.
@@ -649,7 +774,69 @@ load "${SCRIPTS_DIR}/util.sh"
   [ -z "${stream}" ]
 }
 
+@test "parse_extra_certs rejects an entry welded on by a missing semicolon" {
+  # Newlines fold to spaces, so an entry whose line lacks a trailing ';' would
+  # otherwise merge into its neighbour's domain list and produce one nonsense
+  # domain — taking an existing, working certificate down with it.
+  local -A certificates
+  LEGO_EXTRA_CERTS=$'good-cert=good.example.org\nother-cert=other.example.org' \
+    parse_extra_certs certificates 2>/dev/null
+  local -p certificates
 
+  # Folding leaves one entry whose single domain is the two lines run together,
+  # which fails host-name validation. The entry is then reported and skipped
+  # whole rather than half-applied, so nothing is requested for a mangled name.
+  [ ${#certificates[@]} -eq 0 ]
+}
 
+@test "a rejected extra entry leaves an already discovered certificate untouched" {
+  # The important guarantee: a typo in LEGO_EXTRA_CERTS must not damage a
+  # certificate that nginx discovery already found and is renewing.
+  local -A certificates
+  parse_config_file "${FIXTURES_DIR}/nginx_config/single_files/single_server_single_cert_single_name.conf" certificates
 
+  LEGO_EXTRA_CERTS=$'my-cert=extra.example.org\nsecond=other.example.org' \
+    parse_extra_certs certificates 2>/dev/null
+  local -p certificates
 
+  [ ${#certificates[@]} -eq 1 ]
+  local server_names=(${certificates[my-cert]})
+  [ ${#server_names[@]} -eq 2 ]
+  [ "${server_names[0]}" == "example.org" ]
+  [ "${server_names[1]}" == "www.example.org" ]
+}
+
+@test "parse_extra_certs drops domains that are not host names" {
+  local -A certificates
+  LEGO_EXTRA_CERTS="c=a'b.example.org,good.example.org" \
+    parse_extra_certs certificates 2>/dev/null
+  local -p certificates
+
+  # A quote must not discard the whole list, which is what the previous
+  # xargs-based merge did.
+  [ "${certificates[c]}" == "good.example.org " ]
+}
+
+@test "parse_extra_certs keeps a backslash from silently rewriting a domain" {
+  local -A certificates
+  LEGO_EXTRA_CERTS='c=a\b.example.org,good.example.org' \
+    parse_extra_certs certificates 2>/dev/null
+  local -p certificates
+
+  [ "${certificates[c]}" == "good.example.org " ]
+}
+
+@test "parse_extra_certs tolerates whitespace around entries and domains" {
+  local -A certificates
+  LEGO_EXTRA_CERTS="  edge-cert = example.org , www.example.org ;  api-cert=api.example.org  " \
+    parse_extra_certs certificates
+  local -p certificates
+
+  [ ${#certificates[@]} -eq 2 ]
+
+  local edge=(${certificates[edge-cert]})
+  [ ${#edge[@]} -eq 2 ]
+  [ "${edge[0]}" == "example.org" ]
+  [ "${edge[1]}" == "www.example.org" ]
+  [ "${certificates[api-cert]}" == "api.example.org " ]
+}

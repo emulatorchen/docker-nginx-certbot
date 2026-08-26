@@ -166,6 +166,10 @@ Furthermore, we support wildcard domain names, but that requires you to use an
 authenticator capable of DNS-01 challenges, and more info about that may be
 found in the [lego_providers.md](./lego_providers.md) document.
 
+If you need a certificate that no server block references at all — because
+something other than this Nginx serves it — see
+[Certificates Nginx Does Not Serve](./advanced_usage.md#certificates-nginx-does-not-serve).
+
 
 ## ECDSA and RSA Certificates
 [ECDSA (or ECC)][16] certificates use a newer encryption algorithm than the well
