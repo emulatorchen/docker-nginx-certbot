@@ -78,6 +78,9 @@ upstream author][pr373] — thanks for the excellent foundation.
 - `USE_ECDSA`: Set to `0` to use RSA instead of ECDSA (default: `1`)
 
 ### Advanced
+- `LEGO_EXTRA_CERTS`: Certificates to obtain and renew that no server block references, because something other than this Nginx serves them. Format `<cert_name>=<domain>[,<domain>...][;<cert_name>=...]`. See [Certificates Nginx Does Not Serve](./docs/advanced_usage.md#certificates-nginx-does-not-serve).
+- `NGINX_INCLUDE_MAX_DEPTH`: How many levels of `include` directives to follow when reading a config file (default: `10`)
+- `NGINX_PREFIX`: Base directory used to resolve relative `include` paths (default: `/etc/nginx`, matching the image's nginx prefix)
 - `LEGO_DEFAULT_PROVIDER`: Default DNS provider for all certs without an explicit `.dns-<provider>` suffix (e.g. `cloudflare`). See [lego providers](./docs/lego_providers.md).
 - `CERTBOT_AUTHENTICATOR`: Backward-compatible alias for `LEGO_DEFAULT_PROVIDER`. Set to `webroot` or `dns-<provider>`.
 - `CERTBOT_DNS_CREDENTIALS_DIR`: Directory where `.ini` credentials files for [DNS providers](./docs/lego_providers.md) are located (default: `/etc/letsencrypt`).

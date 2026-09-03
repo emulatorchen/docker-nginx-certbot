@@ -140,6 +140,74 @@ these options are found they override the [`USE_ECDSA`](../README.md#optional)
 environment variable.
 
 
+## Certificates Nginx Does Not Serve
+Certificate discovery works by reading the Nginx configuration: it looks for
+[`ssl_certificate_key`](./good_to_know.md#how-the-script-add-domain-names-to-certificate-requests)
+paths and pairs them with the `server_name` entries around them. That is exactly
+right for every certificate Nginx itself serves, but it cannot see a certificate
+this container is meant to obtain on behalf of *something else* — a separate TLS
+terminator sitting in front of Nginx, or a service that reads the PEM files
+directly off a shared volume. There is no server block to find, so nothing is
+requested and nothing is renewed.
+
+Historically the only way around this was to add a dummy server block whose sole
+purpose was to be noticed by discovery. That works, but it is invisible to anyone
+reading the config later, and deleting it as dead weight silently ends renewal.
+
+Declare such certificates explicitly instead, with the `LEGO_EXTRA_CERTS`
+environment variable:
+
+```
+LEGO_EXTRA_CERTS="<cert_name>=<domain>[,<domain>...][;<cert_name>=...]"
+```
+
+Entries are separated by `;`, and the domains within an entry by `,`. For
+example:
+
+```yaml
+environment:
+  - LEGO_EXTRA_CERTS=edge-proxy=example.org,www.example.org;api.dns-route53=*.api.example.org
+```
+
+The certificate is written to `/etc/letsencrypt/live/<cert_name>/`, and the name
+may carry the same suffixes as one parsed out of a config file: a
+`dns-<provider>` token to select which credentials are used
+([Certificate Naming Convention](../README.md#certificate-naming-convention)),
+or a key-type token ([Multi-Certificate Setup](#multi-certificate-setup)).
+Unlike a name taken from a config file, it is restricted to letters, digits,
+`.`, `_` and `-`, and may not begin with a `.` — the name is a directory
+component, and here you do not see the full path you are writing.
+
+Three details worth knowing:
+
+- Naming a certificate that discovery already found is harmless. The domains are
+  merged into the existing entry rather than duplicated, so you can list one
+  redundantly without producing a second request.
+- A malformed entry is reported and skipped, not fatal. One typo must not stop
+  every other certificate in the list from renewing.
+- The value may be written across several lines for readability. Each entry
+  still has to end with its `;` — a newline is treated as whitespace, not as a
+  separator:
+
+  ```yaml
+  environment:
+    - |
+      LEGO_EXTRA_CERTS=edge-proxy=example.org,www.example.org;
+      api.dns-route53=*.api.example.org
+  ```
+
+  A domain that does not look like a host name is reported and skipped, so a
+  missing `;` is caught rather than quietly welding two entries together.
+
+When [`USE_LOCAL_CA`](#local-ca) is enabled, these certificates are issued by the
+local CA exactly like discovered ones, so whatever serves them has a file to open
+during development. Note that the local CA and lego are alternatives rather than
+stages: when `USE_LOCAL_CA=1` lego does not run at all, so in a normal
+deployment an extra certificate does not exist on disk until lego's first run
+completes. If the service that consumes it cannot start without the file, give it
+a self-signed placeholder of your own, or let it retry.
+
+
 ## Use Custom ACME URL
 There are two variables available at the top of the
 [`run_lego.sh`](../src/scripts/run_lego.sh) script:
