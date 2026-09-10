@@ -10,3 +10,4 @@ CVE-2026-57433  # Storable is not shipped in any image (perl-base only on debian
 CVE-2026-52490  # tiffcrop only (tools/tiffcrop.c); libtiff-tools is not installed in any image
 CVE-2026-16742  # systemd-homed only; no image installs it (libsystemd0/libudev1 only)
 CVE-2025-69720  # infocmp CLI only; removed (dpkg path-exclude) in debian and ubuntu; alpine ncurses is past the 6.5-20251213 fix
+CVE-2026-78408  # nsenter --join-cgroup only; removed (dpkg path-exclude) in debian; ubuntu and alpine nsenter lack --join-cgroup

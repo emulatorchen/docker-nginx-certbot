@@ -65,4 +65,11 @@ elif [ -e /usr/bin/infocmp ]; then
     esac
 fi
 
+# CVE-2026-78408: only nsenter --join-cgroup is affected. Debian's nsenter has it,
+# so nsenter goes; Ubuntu's util-linux 2.39 and Alpine's busybox nsenter lack it.
+[ "$variant" != debian ] || drop_binary /usr/bin/nsenter
+if command -v nsenter >/dev/null && nsenter --help 2>&1 | grep -q -- --join-cgroup; then
+    fail "nsenter supports --join-cgroup"
+fi
+
 echo "cve_mitigations ($variant): all checks passed"
