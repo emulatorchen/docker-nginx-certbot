@@ -69,6 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libheif-plugin-dav1d=1.19.8-1+deb13u1 \
     libheif-plugin-libde265=1.19.8-1+deb13u1 \
     libheif1=1.19.8-1+deb13u1 \
+    libtiff6=4.7.0-3+deb13u3 \
     && rm -rf /var/lib/apt/lists/*
 # --- end CVE security pins ---
 
