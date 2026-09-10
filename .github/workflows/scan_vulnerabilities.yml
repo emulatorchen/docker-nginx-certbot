@@ -370,21 +370,29 @@ jobs:
           git config user.email "github-actions@github.com"
           git config user.name "github-actions"
 
+          # Print the Dockerfile without its CVE security pins block, and without the blank
+          # line that follows the block, so repeated rewrites do not pile up blank lines.
+          strip_os_pins() {
+            awk '/# --- CVE security pins \(auto-managed\)/ {skip=1}
+                 /# --- end CVE security pins ---/ {skip=0; gap=1; next}
+                 gap && /^$/ {gap=0; next}
+                 {gap=0}
+                 !skip {print}' "$1"
+          }
+
           # Write or remove the CVE security pins block.
           # Empty FIXES removes the block (base image shipped the fix natively).
           write_os_pins() {
             local DOCKERFILE="$1" PM="$2" FIXES="$3"
             if [ -z "$FIXES" ]; then
               grep -q "CVE security pins" "$DOCKERFILE" 2>/dev/null || return 0
-              awk '/# --- CVE security pins \(auto-managed\)/{skip=1} /# --- end CVE security pins ---/{skip=0;next} !skip{print}' \
-                "$DOCKERFILE" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "$DOCKERFILE"
+              strip_os_pins "$DOCKERFILE" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "$DOCKERFILE"
               return
             fi
             local PKGS_FILE
             PKGS_FILE=$(mktemp)
             echo "$FIXES" | tr ' ' '\n' | grep -v '^$' | sort -u > "$PKGS_FILE"
-            awk '/# --- CVE security pins \(auto-managed\)/{skip=1} /# --- end CVE security pins ---/{skip=0;next} !skip{print}' \
-              "$DOCKERFILE" > "${DOCKERFILE}.tmp"
+            strip_os_pins "$DOCKERFILE" > "${DOCKERFILE}.tmp"
             if [ "$PM" = "apt" ]; then
               awk -v pf="$PKGS_FILE" '
                 /^VOLUME/ {
