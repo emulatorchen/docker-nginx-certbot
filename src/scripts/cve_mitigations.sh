@@ -29,4 +29,7 @@ check_absent() {
 check_absent "perl module" -path '*/Archive/Tar.pm' -o -path '*/IO/Compress/*' \
     -o -name GlobMapper.pm -o -name Storable.pm -o -name Storable.so
 
+# CVE-2026-52490: only the tiffcrop tool is affected, and it is not shipped.
+check_absent tiffcrop -name tiffcrop
+
 echo "cve_mitigations ($variant): all checks passed"

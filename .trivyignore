@@ -7,3 +7,4 @@ CVE-2026-42496  # Archive::Tar is not shipped in any image (perl-base only on de
 CVE-2026-42497  # Archive::Tar is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
 CVE-2026-48962  # IO::Compress (File::GlobMapper) is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
 CVE-2026-57433  # Storable is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-52490  # tiffcrop only (tools/tiffcrop.c); libtiff-tools is not installed in any image
