@@ -72,4 +72,24 @@ if command -v nsenter >/dev/null && nsenter --help 2>&1 | grep -q -- --join-cgro
     fail "nsenter supports --join-cgroup"
 fi
 
+# CVE-2026-76642, CVE-2026-78409, CVE-2026-78410: exploitable only through setuid
+# mount(8), and nothing in the image needs a setuid or setgid binary. Strip every
+# such bit; on Debian and Ubuntu through dpkg-statoverride so that reinstalls and
+# upgrades keep them off. Runs last so it also covers files installed above.
+if applying; then
+    if uses_dpkg; then
+        find / -xdev -perm /6000 -type f -exec sh -c '
+            for f; do
+                stat -c "%U %G %a" "$f" | {
+                    read -r user group perms
+                    dpkg-statoverride --force-statoverride-add --update --add \
+                        "$user" "$group" "${perms#?}" "$f"
+                }
+            done' sh {} +
+    else
+        find / -xdev -perm /6000 -type f -exec chmod ug-s {} +
+    fi
+fi
+check_absent "setuid/setgid file" -perm /6000 -type f
+
 echo "cve_mitigations ($variant): all checks passed"

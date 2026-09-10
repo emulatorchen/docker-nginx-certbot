@@ -11,3 +11,6 @@ CVE-2026-52490  # tiffcrop only (tools/tiffcrop.c); libtiff-tools is not install
 CVE-2026-16742  # systemd-homed only; no image installs it (libsystemd0/libudev1 only)
 CVE-2025-69720  # infocmp CLI only; removed (dpkg path-exclude) in debian and ubuntu; alpine ncurses is past the 6.5-20251213 fix
 CVE-2026-78408  # nsenter --join-cgroup only; removed (dpkg path-exclude) in debian; ubuntu and alpine nsenter lack --join-cgroup
+CVE-2026-76642  # only via setuid mount(8); no image has setuid/setgid binaries (dpkg-statoverride on debian/ubuntu)
+CVE-2026-78409  # only via setuid mount(8); no image has setuid/setgid binaries (dpkg-statoverride on debian/ubuntu)
+CVE-2026-78410  # only via setuid mount(8); no image has setuid/setgid binaries (dpkg-statoverride on debian/ubuntu)
