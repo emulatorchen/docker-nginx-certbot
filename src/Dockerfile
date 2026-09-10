@@ -65,11 +65,20 @@ RUN chmod +x -R /scripts && \
 
 # --- CVE security pins (auto-managed) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bsdutils=1:2.41.5-0+deb13u1 \
+    libblkid1=2.41.5-0+deb13u1 \
     libexpat1=2.8.3-1~deb13u1 \
     libheif-plugin-dav1d=1.19.8-1+deb13u1 \
     libheif-plugin-libde265=1.19.8-1+deb13u1 \
     libheif1=1.19.8-1+deb13u1 \
+    liblastlog2-2=2.41.5-0+deb13u1 \
+    libmount1=2.41.5-0+deb13u1 \
+    libsmartcols1=2.41.5-0+deb13u1 \
     libtiff6=4.7.0-3+deb13u3 \
+    libuuid1=2.41.5-0+deb13u1 \
+    login=1:4.16.0-2+really2.41.5-0+deb13u1 \
+    mount=2.41.5-0+deb13u1 \
+    util-linux=2.41.5-0+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 # --- end CVE security pins ---
 
