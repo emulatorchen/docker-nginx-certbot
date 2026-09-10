@@ -35,4 +35,34 @@ check_absent tiffcrop -name tiffcrop
 # CVE-2026-16742: only systemd-homed is affected, and it is not shipped.
 check_absent systemd-homed -name systemd-homed -o -name homectl
 
+applying() { [ "$mode" = apply ]; }
+uses_dpkg() { [ "$variant" != alpine ]; }
+excludes=/etc/dpkg/dpkg.cfg.d/cve-path-excludes
+
+# drop_binary <path>: delete it and add a dpkg path-exclude so later installs and
+# upgrades cannot bring it back.
+drop_binary() {
+    if applying; then
+        grep -qx "path-exclude=$1" "$excludes" 2>/dev/null || echo "path-exclude=$1" >> "$excludes"
+        rm -f "$1"
+    fi
+    [ ! -e "$1" ] || fail "$1 present"
+    grep -qx "path-exclude=$1" "$excludes" || fail "no dpkg path-exclude for $1"
+}
+
+# CVE-2025-69720: only the infocmp CLI is affected, fixed upstream in ncurses
+# 6.5-20251213. Debian has no fixed package, so infocmp goes there and on Ubuntu;
+# Alpine must ship ncurses 6.5_p20251213 or later.
+if uses_dpkg; then
+    drop_binary /usr/bin/infocmp
+elif [ -e /usr/bin/infocmp ]; then
+    owner=$(apk info --who-owns /usr/bin/infocmp 2>/dev/null | sed -n 's/.* is owned by //p')
+    ncurses_version=$(echo "$owner" | sed -n 's/^ncurses-\([0-9][^-]*-r[0-9]*\)$/\1/p')
+    [ -n "$ncurses_version" ] || fail "cannot tell which ncurses owns infocmp: '$owner'"
+    case $(apk version -t "$ncurses_version" 6.5_p20251213-r0) in
+        '>'|'=') ;;
+        *) fail "infocmp comes from ncurses $ncurses_version, older than the fix" ;;
+    esac
+fi
+
 echo "cve_mitigations ($variant): all checks passed"
