@@ -66,6 +66,7 @@ RUN chmod +x -R /scripts && \
 # --- CVE security pins (auto-managed) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bsdutils=1:2.41.5-0+deb13u1 \
+    libaom3=3.12.1-1+deb13u1 \
     libblkid1=2.41.5-0+deb13u1 \
     libexpat1=2.8.3-1~deb13u1 \
     libheif-plugin-dav1d=1.19.8-1+deb13u1 \
