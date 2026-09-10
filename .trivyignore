@@ -1,3 +1,9 @@
 # Suppress CVEs that have been analyzed and accepted.
 # Format: CVE-YYYY-NNNNN  # reason why accepted
 # Example: CVE-2023-12345  # upstream won't fix; not exploitable in our nginx config
+# Each entry below is checked while the images build, by src/scripts/cve_mitigations.sh.
+CVE-2026-9538  # Archive::Tar is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-42496  # Archive::Tar is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-42497  # Archive::Tar is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-48962  # IO::Compress (File::GlobMapper) is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-57433  # Storable is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)

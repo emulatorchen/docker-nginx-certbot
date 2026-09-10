@@ -86,6 +86,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 VOLUME /etc/letsencrypt
 
+# FORK: not present upstream. Do not drop when syncing this file; see UPSTREAM_SYNC.md.
+# Applies and checks what the .trivyignore entries rely on; kept last so it also
+# covers packages installed by earlier layers, including the CVE pin block.
+RUN /scripts/cve_mitigations.sh debian
+
 # The Nginx parent Docker image already expose port 80, so we only need to add
 # port 443 here.
 EXPOSE 443
