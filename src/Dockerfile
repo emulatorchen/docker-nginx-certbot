@@ -66,6 +66,9 @@ RUN chmod +x -R /scripts && \
 # --- CVE security pins (auto-managed) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libexpat1=2.8.3-1~deb13u1 \
+    libheif-plugin-dav1d=1.19.8-1+deb13u1 \
+    libheif-plugin-libde265=1.19.8-1+deb13u1 \
+    libheif1=1.19.8-1+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 # --- end CVE security pins ---
 
