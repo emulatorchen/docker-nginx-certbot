@@ -32,4 +32,7 @@ check_absent "perl module" -path '*/Archive/Tar.pm' -o -path '*/IO/Compress/*' \
 # CVE-2026-52490: only the tiffcrop tool is affected, and it is not shipped.
 check_absent tiffcrop -name tiffcrop
 
+# CVE-2026-16742: only systemd-homed is affected, and it is not shipped.
+check_absent systemd-homed -name systemd-homed -o -name homectl
+
 echo "cve_mitigations ($variant): all checks passed"
