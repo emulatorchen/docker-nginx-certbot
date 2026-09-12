@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Resolve tag
         id: resolve
@@ -60,9 +62,10 @@ jobs:
       - name: Create and push tag
         env:
           TAG: ${{ steps.resolve.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git tag "${TAG}"
-          git push origin "${TAG}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "${TAG}"
 
   security_preflight:
     name: "Security preflight summary"
@@ -856,13 +859,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Delete git tag
         env:
           TAG: ${{ needs.resolve_tag.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           [ -z "$TAG" ] && { echo "No tag to delete"; exit 0; }
-          git push origin --delete "$TAG" || echo "Tag $TAG not found or already deleted"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" \
+            --delete "$TAG" || echo "Tag $TAG not found or already deleted"
 
   cleanup_notice:
     name: "Pending: approve to delete Docker Hub tags"
