@@ -642,6 +642,22 @@ jobs:
           update_os_pins "src/Dockerfile-alpine" "apk" "$VERIFIED_APK"
           update_os_pins "src/Dockerfile-ubuntu" "apt" "$VERIFIED_UBU"
 
+          # The PR body lists only CVEs whose package got a new pin that passed the test
+          # build; triage auto-closes the PR by the CVE IDs in its body.
+          PINNED_OS_ITEMS=""
+          for ITEM in $FIXABLE_OS_ITEMS; do
+            PKG_AT=${ITEM#*(}; PKG_AT=${PKG_AT%%=*}
+            case "${PKG_AT#*@}" in
+              debian) NEW_PINS=$VERIFIED_DEB ;;
+              alpine) NEW_PINS=$VERIFIED_APK ;;
+              *)      NEW_PINS=$VERIFIED_UBU ;;
+            esac
+            # shellcheck disable=SC2086
+            if printf '%s\n' $NEW_PINS | awk -F'>=' -v p="${PKG_AT%@*}" '$1 == p {f = 1} END {exit !f}'; then
+              PINNED_OS_ITEMS="${PINNED_OS_ITEMS} ${ITEM}"
+            fi
+          done
+
           # Post issue comments for packages that failed multi-arch verification
           OPEN_ISSUES_PINS=$(gh issue list --repo "$REPO" --label security \
             --state open --json number,title --limit 100 2>/dev/null || echo "[]")
@@ -756,9 +772,9 @@ jobs:
             printf '\n**lego transitive CVEs (gobinary):** %s\n' \
               "$LEGO_NOTE" >> "$PR_BODY_FILE"
           fi
-          if [ -n "$FIXABLE_OS_ITEMS" ]; then
+          if [ -n "$PINNED_OS_ITEMS" ]; then
             printf '\n**OS package CVEs pinned:**\n' >> "$PR_BODY_FILE"
-            printf '%s\n' $FIXABLE_OS_ITEMS \
+            printf '%s\n' $PINNED_OS_ITEMS \
               | sed 's/\([^(]*\)(\([^@]*\)@\([^=]*\)=\(.*\))/- `\1` — \2 (\3) → `\4`/' \
               >> "$PR_BODY_FILE"
           fi
