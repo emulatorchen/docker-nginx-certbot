@@ -241,6 +241,7 @@ jobs:
     needs: triage
     if: always() && needs.triage.result == 'success'
     runs-on: ubuntu-latest
+    environment: automation
     permissions:
       contents: read
       issues: write
