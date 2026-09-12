@@ -257,7 +257,7 @@ jobs:
           #    - nginx package CVE          → bump FROM nginx:<ver> in Dockerfiles
           #    - lego package CVE           → bump ARG LEGO_VERSION= in Dockerfiles
           #    - gobinary CVE in lego path  → bump ARG LEGO_VERSION= to latest release
-          #    - OS package CVE (os-pkgs)   → pin package version in a dedicated RUN layer
+          #    - OS package CVE (os-pkgs)   → pin a minimum version in the CVE pin block
           # 4. CVE not already covered by an open security PR
 
           TODAY=$(date +%Y-%m-%d)
@@ -305,7 +305,8 @@ jobs:
               "\(.VulnerabilityID)\t\(.PkgName)\t\(.FixedVersion)"
             ' "trivy-${VARIANT}.json" | sort -u)
 
-            # OS package CVEs (class: os-pkgs) — pin version in Dockerfile.
+            # OS package CVEs (class: os-pkgs) — pin a minimum version in the Dockerfile.
+            # Trivy's fixed version is the Debian source version (or the apk version).
             # No COVERED_CVES dedup: OS_FIXES_* must always reflect the full current
             # scan state so stale pins are removed when a base image ships the fix.
             while IFS=$'\t' read -r CVE_ID PKG FIXED; do
@@ -314,14 +315,14 @@ jobs:
               FIXABLE_OS_ITEMS="${FIXABLE_OS_ITEMS} ${CVE_ID}(${PKG}@${VARIANT}=${FIXED})"
               case "$VARIANT" in
                 debian)
-                  OS_FIXES_DEB="${OS_FIXES_DEB} ${PKG}=${FIXED}"
-                  OS_CVE_MAP_DEB="${OS_CVE_MAP_DEB} ${CVE_ID}:${PKG}=${FIXED}" ;;
+                  OS_FIXES_DEB="${OS_FIXES_DEB} ${PKG}>=${FIXED}"
+                  OS_CVE_MAP_DEB="${OS_CVE_MAP_DEB} ${CVE_ID}:${PKG}>=${FIXED}" ;;
                 alpine)
-                  OS_FIXES_APK="${OS_FIXES_APK} ${PKG}=${FIXED}"
-                  OS_CVE_MAP_APK="${OS_CVE_MAP_APK} ${CVE_ID}:${PKG}=${FIXED}" ;;
+                  OS_FIXES_APK="${OS_FIXES_APK} ${PKG}>=${FIXED}"
+                  OS_CVE_MAP_APK="${OS_CVE_MAP_APK} ${CVE_ID}:${PKG}>=${FIXED}" ;;
                 ubuntu)
-                  OS_FIXES_UBU="${OS_FIXES_UBU} ${PKG}=${FIXED}"
-                  OS_CVE_MAP_UBU="${OS_CVE_MAP_UBU} ${CVE_ID}:${PKG}=${FIXED}" ;;
+                  OS_FIXES_UBU="${OS_FIXES_UBU} ${PKG}>=${FIXED}"
+                  OS_CVE_MAP_UBU="${OS_CVE_MAP_UBU} ${CVE_ID}:${PKG}>=${FIXED}" ;;
               esac
             done < <(jq -r '
               .Results[]? |
@@ -397,8 +398,16 @@ jobs:
               awk -v pf="$PKGS_FILE" '
                 /^VOLUME/ {
                   print "# --- CVE security pins (auto-managed) ---"
-                  print "RUN apt-get update && apt-get install -y --no-install-recommends \\"
-                  while ((getline line < pf) > 0) printf "    %s \\\n", line
+                  print "# Each pin is a minimum source version: install the candidate, then check it."
+                  print "RUN set -- \\"
+                  while ((getline line < pf) > 0) printf "        \047%s\047 \\\n", line
+                  print "    && apt-get update \\"
+                  print "    && apt-get install -y --no-install-recommends $(for pin; do echo \"${pin%%>=*}\"; done) \\"
+                  print "    && for pin; do \\"
+                  print "        v=$(dpkg-query -W -f=\047${source:Version}\047 \"${pin%%>=*}\") \\"
+                  print "            && dpkg --compare-versions \"$v\" ge \"${pin#*>=}\" \\"
+                  print "            || { echo \"${pin%%>=*} ${v:-missing} is older than ${pin#*>=}\" >&2; exit 1; }; \\"
+                  print "    done \\"
                   print "    && rm -rf /var/lib/apt/lists/*"
                   print "# --- end CVE security pins ---"
                   print ""
@@ -409,7 +418,7 @@ jobs:
               awk -v pf="$PKGS_FILE" '
                 /^VOLUME/ {
                   printf "# --- CVE security pins (auto-managed) ---\nRUN apk add --no-cache"
-                  while ((getline line < pf) > 0) printf " %s", line
+                  while ((getline line < pf) > 0) printf " \047%s\047", line
                   printf "\n# --- end CVE security pins ---\n\n"
                 }
                 { print }
@@ -418,9 +427,35 @@ jobs:
             rm -f "${DOCKERFILE}.tmp" "$PKGS_FILE"
           }
 
+          # max_floors <image> <apt|apk> <pkg>=<ver>...: keep the highest floor per package,
+          # compared by the image's own package manager.
+          max_floors() {
+            local IMG="$1" PM="$2"
+            shift 2
+            docker run --rm -i --entrypoint sh "$IMG" -s "$PM" "$@" <<'EOF'
+          pm=$1; shift
+          newer() {
+            if [ "$pm" = apt ]; then dpkg --compare-versions "$1" gt "$2"
+            else [ "$(apk version -t "$1" "$2")" = ">" ]; fi
+          }
+          for fix; do echo "${fix%%>=*} ${fix#*>=}"; done | sort -k1,1 | {
+            prev=""; best=""
+            while read -r pkg ver; do
+              if [ "$pkg" = "$prev" ]; then
+                if newer "$ver" "$best"; then best=$ver; fi
+              else
+                if [ -n "$prev" ]; then echo "$prev>=$best"; fi
+                prev=$pkg; best=$ver
+              fi
+            done
+            if [ -n "$prev" ]; then echo "$prev>=$best"; fi
+          }
+          EOF
+          }
+
           # For each pending package, test-build a minimal image for all target platforms.
           # Passes only verified packages; records failures in FAIL_DIR (one file per CVE+pkg).
-          # File name: <CVE>___<pkg=ver>, contents: line 1 = platforms, rest = build error.
+          # File name: <CVE>___<pkg>=<ver>, contents: line 1 = platforms, rest = build error.
           verify_and_filter_pins() {
             local DOCKERFILE="$1" PM="$2" FIXES="$3" CVE_MAP="$4" FAIL_DIR="$5"
             [ -z "$FIXES" ] && return
@@ -431,21 +466,21 @@ jobs:
               *Dockerfile-ubuntu) PLATFORMS="linux/amd64,linux/arm64" ;;
               *)                  PLATFORMS="linux/amd64,linux/386,linux/arm64,linux/arm/v7" ;;
             esac
+            # One floor per package, so a package's CVEs are all pinned or all skipped.
+            local MAXED
+            # shellcheck disable=SC2086
+            MAXED=$(max_floors "$BASE_IMG" "$PM" $FIXES) || {
+              echo "::warning::cannot compare package versions in ${BASE_IMG}; no new pins for ${DOCKERFILE}" >&2
+              return 0
+            }
+            FIXES=$MAXED
             local VERIFIED=""
             for PKG_VER in $(echo "$FIXES" | tr ' ' '\n' | grep -v '^$' | sort -u); do
               local TEST_DIR BUILD_LOG BUILD_OK
               TEST_DIR=$(mktemp -d)
-              if [ "$PM" = "apt" ]; then
-                {
-                  echo "FROM ${BASE_IMG}"
-                  echo "RUN apt-get update && apt-get install -y --no-install-recommends ${PKG_VER} && rm -rf /var/lib/apt/lists/*"
-                } > "${TEST_DIR}/Dockerfile"
-              else
-                {
-                  echo "FROM ${BASE_IMG}"
-                  echo "RUN apk add --no-cache ${PKG_VER}"
-                } > "${TEST_DIR}/Dockerfile"
-              fi
+              # The same block the Dockerfile gets, for this one package.
+              printf 'FROM %s\nVOLUME /cve-verify\n' "$BASE_IMG" > "${TEST_DIR}/Dockerfile"
+              write_os_pins "${TEST_DIR}/Dockerfile" "$PM" "$PKG_VER"
               set +e
               BUILD_LOG=$(docker buildx build --platform "$PLATFORMS" "${TEST_DIR}" 2>&1)
               BUILD_OK=$?
@@ -455,12 +490,15 @@ jobs:
                 VERIFIED="${VERIFIED} ${PKG_VER}"
               else
                 local PKG_NAME CVE_FOR_PKG
-                PKG_NAME=$(echo "$PKG_VER" | cut -d= -f1)
-                CVE_FOR_PKG=$(echo "$CVE_MAP" | tr ' ' '\n' | grep ":${PKG_NAME}=" | cut -d: -f1 | head -1)
-                {
-                  echo "$PLATFORMS"
-                  echo "$BUILD_LOG" | tail -10
-                } > "${FAIL_DIR}/${CVE_FOR_PKG}___${PKG_VER}"
+                PKG_NAME=${PKG_VER%%>=*}
+                # The package gets no new pin, so each CVE it was to fix gets the note.
+                for CVE_FOR_PKG in $(echo "$CVE_MAP" | tr ' ' '\n' \
+                    | awk -F: -v p="$PKG_NAME" '{split($2, a, ">="); if (a[1] == p) print $1}' | sort -u); do
+                  {
+                    echo "$PLATFORMS"
+                    echo "$BUILD_LOG" | tail -10
+                  } > "${FAIL_DIR}/${CVE_FOR_PKG}___${PKG_VER}"
+                done
               fi
             done
             echo "$VERIFIED"
@@ -489,7 +527,7 @@ jobs:
             ISSUE_NUM=$(echo "$OPEN_ISSUES_PINS" | jq -r --arg cve "$FAIL_CVE" \
               '.[] | select(.title | contains($cve)) | .number' | head -1)
             [ -z "$ISSUE_NUM" ] && continue
-            COMMENT=$(printf '**Auto-fix blocked for `%s`:** package not available on all target platforms (`%s`) — pin skipped for this image variant.\n```\n%s\n```' \
+            COMMENT=$(printf '**Auto-fix blocked for `%s`:** the test build did not pass on all target platforms (`%s`) — pin skipped for this image variant.\n```\n%s\n```' \
               "$FAIL_PKG" "$FAIL_PLATFORMS" "$FAIL_MSG")
             GH_TOKEN="$GH_ISSUE_TOKEN" gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "$COMMENT"
           done
@@ -596,7 +634,7 @@ jobs:
               >> "$PR_BODY_FILE"
           fi
           if $NEEDS_CLEANUP; then
-            printf '\n**Stale OS package pins removed:** base image update resolved the CVE natively — hardcoded version pins are no longer needed.\n' \
+            printf '\n**Stale OS package pins removed:** base image update resolved the CVE natively — the minimum-version pins are no longer needed.\n' \
               >> "$PR_BODY_FILE"
           fi
           gh pr create \

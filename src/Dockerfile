@@ -64,23 +64,31 @@ RUN chmod +x -R /scripts && \
 # Create a volume to have persistent storage for the obtained certificates.
 
 # --- CVE security pins (auto-managed) ---
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bsdutils=1:2.41.5-0+deb13u1 \
-    libaom3=3.12.1-1+deb13u1 \
-    libblkid1=2.41.5-0+deb13u1 \
-    libde265-0=1.0.15-1+deb13u2 \
-    libexpat1=2.8.3-1~deb13u1 \
-    libheif-plugin-dav1d=1.19.8-1+deb13u1 \
-    libheif-plugin-libde265=1.19.8-1+deb13u1 \
-    libheif1=1.19.8-1+deb13u1 \
-    liblastlog2-2=2.41.5-0+deb13u1 \
-    libmount1=2.41.5-0+deb13u1 \
-    libsmartcols1=2.41.5-0+deb13u1 \
-    libtiff6=4.7.0-3+deb13u3 \
-    libuuid1=2.41.5-0+deb13u1 \
-    login=1:4.16.0-2+really2.41.5-0+deb13u1 \
-    mount=2.41.5-0+deb13u1 \
-    util-linux=2.41.5-0+deb13u1 \
+# Each pin is a minimum source version: install the candidate, then check it.
+RUN set -- \
+        'bsdutils>=2.41.5-0+deb13u1' \
+        'libaom3>=3.12.1-1+deb13u1' \
+        'libblkid1>=2.41.5-0+deb13u1' \
+        'libde265-0>=1.0.15-1+deb13u2' \
+        'libexpat1>=2.8.2-1~deb13u1' \
+        'libheif-plugin-dav1d>=1.19.8-1+deb13u1' \
+        'libheif-plugin-libde265>=1.19.8-1+deb13u1' \
+        'libheif1>=1.19.8-1+deb13u1' \
+        'liblastlog2-2>=2.41.5-0+deb13u1' \
+        'libmount1>=2.41.5-0+deb13u1' \
+        'libsmartcols1>=2.41.5-0+deb13u1' \
+        'libtiff6>=4.7.0-3+deb13u3' \
+        'libuuid1>=2.41.5-0+deb13u1' \
+        'login>=2.41.5-0+deb13u1' \
+        'mount>=2.41.5-0+deb13u1' \
+        'util-linux>=2.41.5-0+deb13u1' \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends $(for pin; do echo "${pin%%>=*}"; done) \
+    && for pin; do \
+        v=$(dpkg-query -W -f='${source:Version}' "${pin%%>=*}") \
+            && dpkg --compare-versions "$v" ge "${pin#*>=}" \
+            || { echo "${pin%%>=*} ${v:-missing} is older than ${pin#*>=}" >&2; exit 1; }; \
+    done \
     && rm -rf /var/lib/apt/lists/*
 # --- end CVE security pins ---
 
