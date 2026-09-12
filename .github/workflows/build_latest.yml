@@ -226,8 +226,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: |
-          if [ "${{ needs.docker_buildx_debian.result }}" = "failure" ] || \
-             [ "${{ needs.docker_buildx_alpine.result }}" = "failure" ] || \
-             [ "${{ needs.docker_buildx_ubuntu.result }}" = "failure" ]; then
+          if [ "${DOCKER_BUILDX_DEBIAN_RESULT}" = "failure" ] || \
+             [ "${DOCKER_BUILDX_ALPINE_RESULT}" = "failure" ] || \
+             [ "${DOCKER_BUILDX_UBUNTU_RESULT}" = "failure" ]; then
             exit 1
           fi
+        env:
+          DOCKER_BUILDX_ALPINE_RESULT: ${{ needs.docker_buildx_alpine.result }}
+          DOCKER_BUILDX_DEBIAN_RESULT: ${{ needs.docker_buildx_debian.result }}
+          DOCKER_BUILDX_UBUNTU_RESULT: ${{ needs.docker_buildx_ubuntu.result }}
