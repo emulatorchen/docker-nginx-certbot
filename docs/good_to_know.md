@@ -257,6 +257,25 @@ since it is nothing "private/personal" about this file. The only thing to
 think about in that case would perhaps be to use a folder that is not under
 `/etc/letsencrypt/`, since that would otherwise cause a double mount.
 
+## Binaries Removed for Unfixed CVEs
+Some components carry CVEs that have no fixed package in the Debian image yet,
+and nothing in this image uses them, so the images leave them out instead of
+waiting for a fix. Each one is listed with its reason in
+[`.trivyignore`](../.trivyignore), and
+[`cve_mitigations.sh`](../src/scripts/cve_mitigations.sh) applies and checks the
+changes as the last step of every image build:
+
+- `infocmp` (Debian and Ubuntu images) and `nsenter` (Debian image) are
+  deleted, and `/etc/dpkg/dpkg.cfg.d/cve-path-excludes` keeps later installs
+  and upgrades from putting them back.
+- No binary is setuid or setgid. On Debian and Ubuntu, `dpkg-statoverride --list`
+  shows the overrides that keep it that way across upgrades.
+
+In an image built on top of this one, running
+`/scripts/cve_mitigations.sh <debian|ubuntu|alpine> --check` as root tells you
+whether these still hold. To get one of the tools back, delete the exclude file or the
+override (`dpkg-statoverride --remove <path>`) and reinstall the package.
+
 ## Help Migrating from `@staticfloat`'s Image
 The two images are not that different when it comes to building/running, since
 this repository was originally a fork. So just like in `@staticfloat`'s setup

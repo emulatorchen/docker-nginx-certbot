@@ -1,3 +1,16 @@
 # Suppress CVEs that have been analyzed and accepted.
 # Format: CVE-YYYY-NNNNN  # reason why accepted
 # Example: CVE-2023-12345  # upstream won't fix; not exploitable in our nginx config
+# Each entry below is checked while the images build, by src/scripts/cve_mitigations.sh.
+CVE-2026-9538  # Archive::Tar is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-42496  # Archive::Tar is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-42497  # Archive::Tar is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-48962  # IO::Compress (File::GlobMapper) is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-57433  # Storable is not shipped in any image (perl-base only on debian/ubuntu, no perl on alpine)
+CVE-2026-52490  # tiffcrop only (tools/tiffcrop.c); libtiff-tools is not installed in any image
+CVE-2026-16742  # systemd-homed only; no image installs it (libsystemd0/libudev1 only)
+CVE-2025-69720  # infocmp CLI only; removed (dpkg path-exclude) in debian and ubuntu; alpine ncurses is past the 6.5-20251213 fix
+CVE-2026-78408  # nsenter --join-cgroup only; removed (dpkg path-exclude) in debian; ubuntu and alpine nsenter lack --join-cgroup
+CVE-2026-76642  # only via setuid mount(8); no image has setuid/setgid binaries (dpkg-statoverride on debian/ubuntu)
+CVE-2026-78409  # only via setuid mount(8); no image has setuid/setgid binaries (dpkg-statoverride on debian/ubuntu)
+CVE-2026-78410  # only via setuid mount(8); no image has setuid/setgid binaries (dpkg-statoverride on debian/ubuntu)

@@ -99,9 +99,21 @@ jobs:
         run: |
           TODAY=$(date +%Y-%m-%d)
 
+          # A variant whose scan failed has no JSON, or an incomplete one, and "not detected"
+          # would then mean "not scanned": close nothing, but still triage what was scanned.
+          SCANNED=""
+          MISSING=false
+          for VARIANT in debian alpine ubuntu; do
+            if jq -e .SchemaVersion "trivy-${VARIANT}.json" > /dev/null 2>&1; then
+              SCANNED="${SCANNED} ${VARIANT}"
+            else
+              echo "::error::trivy-${VARIANT}.json is missing or incomplete (the ${VARIANT} scan failed); not closing any issue or PR."
+              MISSING=true
+            fi
+          done
+
           # Collect all unique CRITICAL/HIGH CVE IDs across all three images using jq
-          ALL_CVES=$(for VARIANT in debian alpine ubuntu; do
-            [ -f "trivy-${VARIANT}.json" ] || continue
+          ALL_CVES=$(for VARIANT in $SCANNED; do
             jq -r '.Results[]?.Vulnerabilities[]? |
               select(.Severity == "CRITICAL" or .Severity == "HIGH") |
               .VulnerabilityID' "trivy-${VARIANT}.json"
@@ -113,35 +125,37 @@ jobs:
           OPEN_PRS=$(gh pr list --repo "$REPO" --label security \
             --state open --json number,body --limit 100 2>/dev/null || echo "[]")
 
-          # Close issues for CVEs no longer detected
-          echo "$OPEN_ISSUES" | jq -r '.[].title' | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u | \
-          while read -r CVE_ID; do
-            [ -z "$CVE_ID" ] && continue
-            echo "$ALL_CVES" | grep -qx "$CVE_ID" && continue
-            ISSUE_NUM=$(echo "$OPEN_ISSUES" | jq -r --arg cve "$CVE_ID" \
-              '.[] | select(.title | contains($cve)) | .number' | head -1)
-            if [ -n "$ISSUE_NUM" ]; then
-              gh issue close "$ISSUE_NUM" --repo "$REPO" \
-                --comment "Resolved — ${CVE_ID} no longer detected in weekly scan (${TODAY})."
-            fi
-          done
+          if ! $MISSING; then
+            # Close issues for CVEs no longer detected
+            echo "$OPEN_ISSUES" | jq -r '.[].title' | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u | \
+            while read -r CVE_ID; do
+              [ -z "$CVE_ID" ] && continue
+              echo "$ALL_CVES" | grep -qx "$CVE_ID" && continue
+              ISSUE_NUM=$(echo "$OPEN_ISSUES" | jq -r --arg cve "$CVE_ID" \
+                '.[] | select(.title | contains($cve)) | .number' | head -1)
+              if [ -n "$ISSUE_NUM" ]; then
+                gh issue close "$ISSUE_NUM" --repo "$REPO" \
+                  --comment "Resolved — ${CVE_ID} no longer detected in weekly scan (${TODAY})."
+              fi
+            done
 
-          # Close auto-fix PRs where all CVEs in the PR body are resolved
-          echo "$OPEN_PRS" | jq -c '.[]' | while read -r PR_JSON; do
-            PR_NUM=$(echo "$PR_JSON" | jq -r '.number')
-            PR_BODY=$(echo "$PR_JSON" | jq -r '.body // ""')
-            PR_CVES=$(echo "$PR_BODY" | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u)
-            [ -z "$PR_CVES" ] && continue
-            ALL_RESOLVED=true
-            while read -r PR_CVE; do
-              [ -z "$PR_CVE" ] && continue
-              echo "$ALL_CVES" | grep -qx "$PR_CVE" && { ALL_RESOLVED=false; break; }
-            done <<< "$PR_CVES"
-            if [ "$ALL_RESOLVED" = true ]; then
-              gh pr close "$PR_NUM" --repo "$REPO" \
-                --comment "All CVEs in this PR are resolved — closing automatically (${TODAY})."
-            fi
-          done
+            # Close auto-fix PRs where all CVEs in the PR body are resolved
+            echo "$OPEN_PRS" | jq -c '.[]' | while read -r PR_JSON; do
+              PR_NUM=$(echo "$PR_JSON" | jq -r '.number')
+              PR_BODY=$(echo "$PR_JSON" | jq -r '.body // ""')
+              PR_CVES=$(echo "$PR_BODY" | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u)
+              [ -z "$PR_CVES" ] && continue
+              ALL_RESOLVED=true
+              while read -r PR_CVE; do
+                [ -z "$PR_CVE" ] && continue
+                echo "$ALL_CVES" | grep -qx "$PR_CVE" && { ALL_RESOLVED=false; break; }
+              done <<< "$PR_CVES"
+              if [ "$ALL_RESOLVED" = true ]; then
+                gh pr close "$PR_NUM" --repo "$REPO" \
+                  --comment "All CVEs in this PR are resolved — closing automatically (${TODAY})."
+              fi
+            done
+          fi
 
           if [ -z "$ALL_CVES" ]; then
             echo "No CRITICAL/HIGH CVEs found across all images."
@@ -163,8 +177,7 @@ jobs:
             LAST_FIXED=""
             FIRST_FIXED=true
 
-            for VARIANT in debian alpine ubuntu; do
-              [ -f "trivy-${VARIANT}.json" ] || continue
+            for VARIANT in $SCANNED; do
               ROW=$(jq -r --arg cve "$CVE_ID" '
                 .Results[]?.Vulnerabilities[]? |
                 select(.VulnerabilityID == $cve and (.Severity == "CRITICAL" or .Severity == "HIGH")) |
@@ -257,7 +270,7 @@ jobs:
           #    - nginx package CVE          → bump FROM nginx:<ver> in Dockerfiles
           #    - lego package CVE           → bump ARG LEGO_VERSION= in Dockerfiles
           #    - gobinary CVE in lego path  → bump ARG LEGO_VERSION= to latest release
-          #    - OS package CVE (os-pkgs)   → pin package version in a dedicated RUN layer
+          #    - OS package CVE (os-pkgs)   → pin a minimum version in the CVE pin block
           # 4. CVE not already covered by an open security PR
 
           TODAY=$(date +%Y-%m-%d)
@@ -284,9 +297,14 @@ jobs:
           OS_CVE_MAP_APK=""
           OS_CVE_MAP_UBU=""
           LEGO_TRANSITIVE_CVES=""
+          INCOMPLETE_SCANS=""
 
           for VARIANT in debian alpine ubuntu; do
-            [ -f "trivy-${VARIANT}.json" ] || continue
+            if ! jq -e .SchemaVersion "trivy-${VARIANT}.json" > /dev/null 2>&1; then
+              echo "::warning::trivy-${VARIANT}.json is missing or incomplete (the ${VARIANT} scan failed); no fixes from it this run."
+              INCOMPLETE_SCANS="${INCOMPLETE_SCANS} ${VARIANT}"
+              continue
+            fi
 
             # nginx / lego direct CVEs
             while IFS=$'\t' read -r CVE_ID PKG FIXED; do
@@ -305,23 +323,23 @@ jobs:
               "\(.VulnerabilityID)\t\(.PkgName)\t\(.FixedVersion)"
             ' "trivy-${VARIANT}.json" | sort -u)
 
-            # OS package CVEs (class: os-pkgs) — pin version in Dockerfile.
-            # No COVERED_CVES dedup: OS_FIXES_* must always reflect the full current
-            # scan state so stale pins are removed when a base image ships the fix.
+            # OS package CVEs (class: os-pkgs) — pin a minimum version in the Dockerfile.
+            # Trivy's fixed version is the Debian source version (or the apk version).
+            # These are new fixes only: update_os_pins re-checks the pins already there.
             while IFS=$'\t' read -r CVE_ID PKG FIXED; do
               [ -z "$CVE_ID" ] && continue
               case "$PKG" in nginx*|lego*) continue ;; esac
               FIXABLE_OS_ITEMS="${FIXABLE_OS_ITEMS} ${CVE_ID}(${PKG}@${VARIANT}=${FIXED})"
               case "$VARIANT" in
                 debian)
-                  OS_FIXES_DEB="${OS_FIXES_DEB} ${PKG}=${FIXED}"
-                  OS_CVE_MAP_DEB="${OS_CVE_MAP_DEB} ${CVE_ID}:${PKG}=${FIXED}" ;;
+                  OS_FIXES_DEB="${OS_FIXES_DEB} ${PKG}>=${FIXED}"
+                  OS_CVE_MAP_DEB="${OS_CVE_MAP_DEB} ${CVE_ID}:${PKG}>=${FIXED}" ;;
                 alpine)
-                  OS_FIXES_APK="${OS_FIXES_APK} ${PKG}=${FIXED}"
-                  OS_CVE_MAP_APK="${OS_CVE_MAP_APK} ${CVE_ID}:${PKG}=${FIXED}" ;;
+                  OS_FIXES_APK="${OS_FIXES_APK} ${PKG}>=${FIXED}"
+                  OS_CVE_MAP_APK="${OS_CVE_MAP_APK} ${CVE_ID}:${PKG}>=${FIXED}" ;;
                 ubuntu)
-                  OS_FIXES_UBU="${OS_FIXES_UBU} ${PKG}=${FIXED}"
-                  OS_CVE_MAP_UBU="${OS_CVE_MAP_UBU} ${CVE_ID}:${PKG}=${FIXED}" ;;
+                  OS_FIXES_UBU="${OS_FIXES_UBU} ${PKG}>=${FIXED}"
+                  OS_CVE_MAP_UBU="${OS_CVE_MAP_UBU} ${CVE_ID}:${PKG}>=${FIXED}" ;;
               esac
             done < <(jq -r '
               .Results[]? |
@@ -349,20 +367,20 @@ jobs:
             ' "trivy-${VARIANT}.json" | sort -u)
           done
 
-          # Detect whether existing pin blocks need cleanup (CVE resolved in base image).
-          # Checked here so we know to proceed even when no *new* CVEs are found.
+          SCAN_NOTE="${INCOMPLETE_SCANS:+ (missing or incomplete scans:${INCOMPLETE_SCANS})}"
+
+          # The scan above ran on images that already have the current pins, so a pin that
+          # fixed its CVE is invisible to it. update_os_pins re-checks existing pins against
+          # an image built without them and sets NEEDS_CLEANUP when one is dropped.
           NEEDS_CLEANUP=false
-          [ -z "$OS_FIXES_DEB" ] && \
-            grep -q "CVE security pins" src/Dockerfile 2>/dev/null && NEEDS_CLEANUP=true
-          [ -z "$OS_FIXES_APK" ] && \
-            grep -q "CVE security pins" src/Dockerfile-alpine 2>/dev/null && NEEDS_CLEANUP=true
-          [ -z "$OS_FIXES_UBU" ] && \
-            grep -q "CVE security pins" src/Dockerfile-ubuntu 2>/dev/null && NEEDS_CLEANUP=true
+          HAS_PINS=false
+          grep -q "CVE security pins" src/Dockerfile src/Dockerfile-alpine src/Dockerfile-ubuntu \
+            2>/dev/null && HAS_PINS=true
 
           if [ -z "$FIXABLE_NGINX" ] && [ -z "$FIXABLE_LEGO" ] && \
              [ -z "$FIXABLE_OS_ITEMS" ] && [ -z "$LEGO_TRANSITIVE_CVES" ] && \
-             ! $NEEDS_CLEANUP; then
-            echo "No auto-fixable CVEs found — no PR created."
+             ! $HAS_PINS; then
+            echo "No auto-fixable CVEs found${SCAN_NOTE} — no PR created."
             exit 0
           fi
 
@@ -370,27 +388,43 @@ jobs:
           git config user.email "github-actions@github.com"
           git config user.name "github-actions"
 
+          # Print the Dockerfile without its CVE security pins block, and without the blank
+          # line that follows the block, so repeated rewrites do not pile up blank lines.
+          strip_os_pins() {
+            awk '/# --- CVE security pins \(auto-managed\)/ {skip=1}
+                 /# --- end CVE security pins ---/ {skip=0; gap=1; next}
+                 gap && /^$/ {gap=0; next}
+                 {gap=0}
+                 !skip {print}' "$1"
+          }
+
           # Write or remove the CVE security pins block.
           # Empty FIXES removes the block (base image shipped the fix natively).
           write_os_pins() {
             local DOCKERFILE="$1" PM="$2" FIXES="$3"
             if [ -z "$FIXES" ]; then
               grep -q "CVE security pins" "$DOCKERFILE" 2>/dev/null || return 0
-              awk '/# --- CVE security pins \(auto-managed\)/{skip=1} /# --- end CVE security pins ---/{skip=0;next} !skip{print}' \
-                "$DOCKERFILE" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "$DOCKERFILE"
+              strip_os_pins "$DOCKERFILE" > "${DOCKERFILE}.tmp" && mv "${DOCKERFILE}.tmp" "$DOCKERFILE"
               return
             fi
             local PKGS_FILE
             PKGS_FILE=$(mktemp)
-            echo "$FIXES" | tr ' ' '\n' | grep -v '^$' | sort -u > "$PKGS_FILE"
-            awk '/# --- CVE security pins \(auto-managed\)/{skip=1} /# --- end CVE security pins ---/{skip=0;next} !skip{print}' \
-              "$DOCKERFILE" > "${DOCKERFILE}.tmp"
+            echo "$FIXES" | tr ' ' '\n' | grep -v '^$' | LC_ALL=C sort -u > "$PKGS_FILE"
+            strip_os_pins "$DOCKERFILE" > "${DOCKERFILE}.tmp"
             if [ "$PM" = "apt" ]; then
               awk -v pf="$PKGS_FILE" '
                 /^VOLUME/ {
                   print "# --- CVE security pins (auto-managed) ---"
-                  print "RUN apt-get update && apt-get install -y --no-install-recommends \\"
-                  while ((getline line < pf) > 0) printf "    %s \\\n", line
+                  print "# Each pin is a minimum source version: install the candidate, then check it."
+                  print "RUN set -- \\"
+                  while ((getline line < pf) > 0) printf "        \047%s\047 \\\n", line
+                  print "    && apt-get update \\"
+                  print "    && apt-get install -y --no-install-recommends $(for pin; do echo \"${pin%%>=*}\"; done) \\"
+                  print "    && for pin; do \\"
+                  print "        v=$(dpkg-query -W -f=\047${source:Version}\047 \"${pin%%>=*}\") \\"
+                  print "            && dpkg --compare-versions \"$v\" ge \"${pin#*>=}\" \\"
+                  print "            || { echo \"${pin%%>=*} ${v:-missing} is older than ${pin#*>=}\" >&2; exit 1; }; \\"
+                  print "    done \\"
                   print "    && rm -rf /var/lib/apt/lists/*"
                   print "# --- end CVE security pins ---"
                   print ""
@@ -401,7 +435,7 @@ jobs:
               awk -v pf="$PKGS_FILE" '
                 /^VOLUME/ {
                   printf "# --- CVE security pins (auto-managed) ---\nRUN apk add --no-cache"
-                  while ((getline line < pf) > 0) printf " %s", line
+                  while ((getline line < pf) > 0) printf " \047%s\047", line
                   printf "\n# --- end CVE security pins ---\n\n"
                 }
                 { print }
@@ -410,9 +444,35 @@ jobs:
             rm -f "${DOCKERFILE}.tmp" "$PKGS_FILE"
           }
 
+          # max_floors <image> <apt|apk> <pkg>=<ver>...: keep the highest floor per package,
+          # compared by the image's own package manager.
+          max_floors() {
+            local IMG="$1" PM="$2"
+            shift 2
+            docker run --rm -i --entrypoint sh "$IMG" -s "$PM" "$@" <<'EOF'
+          pm=$1; shift
+          newer() {
+            if [ "$pm" = apt ]; then dpkg --compare-versions "$1" gt "$2"
+            else [ "$(apk version -t "$1" "$2")" = ">" ]; fi
+          }
+          for fix; do echo "${fix%%>=*} ${fix#*>=}"; done | sort -k1,1 | {
+            prev=""; best=""
+            while read -r pkg ver; do
+              if [ "$pkg" = "$prev" ]; then
+                if newer "$ver" "$best"; then best=$ver; fi
+              else
+                if [ -n "$prev" ]; then echo "$prev>=$best"; fi
+                prev=$pkg; best=$ver
+              fi
+            done
+            if [ -n "$prev" ]; then echo "$prev>=$best"; fi
+          }
+          EOF
+          }
+
           # For each pending package, test-build a minimal image for all target platforms.
           # Passes only verified packages; records failures in FAIL_DIR (one file per CVE+pkg).
-          # File name: <CVE>___<pkg=ver>, contents: line 1 = platforms, rest = build error.
+          # File name: <CVE>___<pkg>=<ver>, contents: line 1 = platforms, rest = build error.
           verify_and_filter_pins() {
             local DOCKERFILE="$1" PM="$2" FIXES="$3" CVE_MAP="$4" FAIL_DIR="$5"
             [ -z "$FIXES" ] && return
@@ -423,21 +483,21 @@ jobs:
               *Dockerfile-ubuntu) PLATFORMS="linux/amd64,linux/arm64" ;;
               *)                  PLATFORMS="linux/amd64,linux/386,linux/arm64,linux/arm/v7" ;;
             esac
+            # One floor per package, so a package's CVEs are all pinned or all skipped.
+            local MAXED
+            # shellcheck disable=SC2086
+            MAXED=$(max_floors "$BASE_IMG" "$PM" $FIXES) || {
+              echo "::warning::cannot compare package versions in ${BASE_IMG}; no new pins for ${DOCKERFILE}" >&2
+              return 0
+            }
+            FIXES=$MAXED
             local VERIFIED=""
             for PKG_VER in $(echo "$FIXES" | tr ' ' '\n' | grep -v '^$' | sort -u); do
               local TEST_DIR BUILD_LOG BUILD_OK
               TEST_DIR=$(mktemp -d)
-              if [ "$PM" = "apt" ]; then
-                {
-                  echo "FROM ${BASE_IMG}"
-                  echo "RUN apt-get update && apt-get install -y --no-install-recommends ${PKG_VER} && rm -rf /var/lib/apt/lists/*"
-                } > "${TEST_DIR}/Dockerfile"
-              else
-                {
-                  echo "FROM ${BASE_IMG}"
-                  echo "RUN apk add --no-cache ${PKG_VER}"
-                } > "${TEST_DIR}/Dockerfile"
-              fi
+              # The same block the Dockerfile gets, for this one package.
+              printf 'FROM %s\nVOLUME /cve-verify\n' "$BASE_IMG" > "${TEST_DIR}/Dockerfile"
+              write_os_pins "${TEST_DIR}/Dockerfile" "$PM" "$PKG_VER"
               set +e
               BUILD_LOG=$(docker buildx build --platform "$PLATFORMS" "${TEST_DIR}" 2>&1)
               BUILD_OK=$?
@@ -447,12 +507,15 @@ jobs:
                 VERIFIED="${VERIFIED} ${PKG_VER}"
               else
                 local PKG_NAME CVE_FOR_PKG
-                PKG_NAME=$(echo "$PKG_VER" | cut -d= -f1)
-                CVE_FOR_PKG=$(echo "$CVE_MAP" | tr ' ' '\n' | grep ":${PKG_NAME}=" | cut -d: -f1 | head -1)
-                {
-                  echo "$PLATFORMS"
-                  echo "$BUILD_LOG" | tail -10
-                } > "${FAIL_DIR}/${CVE_FOR_PKG}___${PKG_VER}"
+                PKG_NAME=${PKG_VER%%>=*}
+                # The package gets no new pin, so each CVE it was to fix gets the note.
+                for CVE_FOR_PKG in $(echo "$CVE_MAP" | tr ' ' '\n' \
+                    | awk -F: -v p="$PKG_NAME" '{split($2, a, ">="); if (a[1] == p) print $1}' | sort -u); do
+                  {
+                    echo "$PLATFORMS"
+                    echo "$BUILD_LOG" | tail -10
+                  } > "${FAIL_DIR}/${CVE_FOR_PKG}___${PKG_VER}"
+                done
               fi
             done
             echo "$VERIFIED"
@@ -463,9 +526,137 @@ jobs:
           VERIFIED_APK=$(verify_and_filter_pins "src/Dockerfile-alpine" "apk" "$OS_FIXES_APK" "$OS_CVE_MAP_APK" "$FAIL_DIR")
           VERIFIED_UBU=$(verify_and_filter_pins "src/Dockerfile-ubuntu" "apt" "$OS_FIXES_UBU" "$OS_CVE_MAP_UBU" "$FAIL_DIR")
 
-          write_os_pins "src/Dockerfile"        "apt" "$VERIFIED_DEB"
-          write_os_pins "src/Dockerfile-alpine" "apk" "$VERIFIED_APK"
-          write_os_pins "src/Dockerfile-ubuntu" "apt" "$VERIFIED_UBU"
+          # The CVE pin block a Dockerfile carries, markers included.
+          os_pins_block() {
+            awk '/# --- CVE security pins \(auto-managed\)/, /# --- end CVE security pins ---/' "$1"
+          }
+
+          # Pins currently in a Dockerfile's block, one per line (pkg>=ver).
+          current_pins() {
+            os_pins_block "$1" | grep -oE "'[^' ]+>=[^' ]+'" | tr -d "'" | sort -u || true
+          }
+
+          # check_os_pins <dockerfile> <apt|apk>: stop when the block is not the one write_os_pins
+          # writes back from the pins current_pins can read — an older pin format, a hand edit —
+          # because rewriting it would drop whatever could not be read. Change the block layout
+          # in write_os_pins and in the Dockerfiles in the same commit.
+          check_os_pins() {
+            local DOCKERFILE="$1" PM="$2" COPY BLOCK_DIFF DIFF_RC=0 AFTER
+            grep -q "CVE security pins" "$DOCKERFILE" 2>/dev/null || return 0
+            COPY=$(mktemp)
+            cp "$DOCKERFILE" "$COPY"
+            write_os_pins "$COPY" "$PM" "$(current_pins "$DOCKERFILE" | tr '\n' ' ')"
+            BLOCK_DIFF=$(diff <(os_pins_block "$DOCKERFILE") <(os_pins_block "$COPY")) || DIFF_RC=$?
+            rm -f "$COPY"
+            if [ "$DIFF_RC" -gt 1 ]; then
+              echo "::error::${DOCKERFILE}: the CVE pin block could not be compared with the one this job writes (diff exited ${DIFF_RC})."
+              exit 1
+            fi
+            if [ -n "$BLOCK_DIFF" ]; then
+              echo "::error::${DOCKERFILE}: the CVE pin block is not the one this job writes from the pins it can read, so rewriting it would drop pins; the difference is in the log below."
+              echo "$BLOCK_DIFF"
+              exit 1
+            fi
+            # write_os_pins inserts the block ahead of every VOLUME line, so a block that is not
+            # in front of one would be moved by a rewrite; blank and comment lines may sit between.
+            AFTER=$(awk '/# --- end CVE security pins ---/ {f = 1; next}
+                         f && NF && $0 !~ /^[[:space:]]*#/ {print; exit}' "$DOCKERFILE")
+            case "$AFTER" in
+              VOLUME*) ;;
+              *)
+                echo "::error::${DOCKERFILE}: the instruction after the CVE pin block is '${AFTER:-none}', not VOLUME, so a rewrite would move the block; put it in front of VOLUME or change write_os_pins."
+                exit 1
+                ;;
+            esac
+          }
+
+          # keep_needed_pins <dockerfile> <apt|apk>: print the pins that an image built without
+          # the block still needs: that image's version is below the pinned minimum, or apt
+          # would still upgrade the package (apk keeps an installed version that meets it).
+          # Keeps every pin when that image cannot be built or fully inspected.
+          keep_needed_pins() {
+            local DOCKERFILE="$1" PM="$2" PINS OUT PROBE
+            PINS=$(current_pins "$DOCKERFILE")
+            [ -z "$PINS" ] && return 0
+            PROBE=$(mktemp)
+            cat > "$PROBE" <<'EOF'
+          pm=$1; shift
+          if [ "$pm" = apt ]; then
+            upd=$(apt-get update -qq 2>&1) && [ -z "$upd" ] || exit 1
+          fi
+          for pin; do
+            pkg=${pin%%>=*}; min=${pin#*>=}
+            if [ "$pm" = apt ]; then
+              v=$(dpkg-query -W -f='${source:Version}' "$pkg" 2>/dev/null) || { echo "drop $pin"; continue; }
+              inst=$(dpkg-query -W -f='${Version}' "$pkg")
+              cand=$(apt-cache policy "$pkg" | awk '$1 == "Candidate:" {print $2}')
+              if dpkg --compare-versions "$v" lt "$min" || dpkg --compare-versions "$inst" lt "$cand" 2>/dev/null; then
+                echo "keep $pin"
+              else
+                echo "drop $pin"
+              fi
+            else
+              v=$(apk list -I 2>/dev/null | awk -v p="$pkg" '{n = $1; sub(/-[^-]*-r[0-9]+$/, "", n); if (n == p) {print substr($1, length(p) + 2); exit}}')
+              if [ -z "$v" ]; then echo "drop $pin"
+              elif [ "$(apk version -t "$v" "$min")" = "<" ]; then echo "keep $pin"
+              else echo "drop $pin"; fi
+            fi
+          done
+          echo done
+          EOF
+            strip_os_pins "$DOCKERFILE" > "${DOCKERFILE}.unpinned"
+            # shellcheck disable=SC2086
+            if docker buildx build --platform linux/amd64 --load -t cve-unpinned \
+                 -f "${DOCKERFILE}.unpinned" "$(dirname "$DOCKERFILE")" > /dev/null 2>&1 \
+               && OUT=$(docker run --rm -i --entrypoint sh cve-unpinned -s "$PM" $PINS < "$PROBE") \
+               && [ "$(echo "$OUT" | tail -1)" = "done" ]; then
+              echo "$OUT" | sed -n 's/^keep //p'
+            else
+              echo "::warning::could not re-check the CVE pins in ${DOCKERFILE}; keeping all of them" >&2
+              echo "$PINS"
+            fi
+            rm -f "${DOCKERFILE}.unpinned" "$PROBE"
+          }
+
+          # merge_pins <kept> <new>: a new pin replaces a kept pin for the same package.
+          merge_pins() {
+            # shellcheck disable=SC2086
+            printf '%s\n' $1 | awk -v new="$2" '
+              BEGIN { n = split(new, a, " "); for (i = 1; i <= n; i++) { split(a[i], b, ">="); replaced[b[1]] = 1 } }
+              $0 != "" { split($0, c, ">="); if (!(c[1] in replaced)) print }
+              END { for (i = 1; i <= n; i++) print a[i] }'
+          }
+
+          # update_os_pins <dockerfile> <apt|apk> <verified new pins>: rewrite the block from the
+          # pins still needed plus the new ones; sets NEEDS_CLEANUP when a pin is dropped.
+          update_os_pins() {
+            local DOCKERFILE="$1" PM="$2" NEW="$3" KEPT BEFORE
+            check_os_pins "$DOCKERFILE" "$PM"
+            BEFORE=$(current_pins "$DOCKERFILE" | grep -c . || true)
+            KEPT=$(keep_needed_pins "$DOCKERFILE" "$PM")
+            if [ "$(echo "$KEPT" | grep -c . || true)" -lt "$BEFORE" ]; then NEEDS_CLEANUP=true; fi
+            write_os_pins "$DOCKERFILE" "$PM" "$(merge_pins "$KEPT" "$NEW" | tr '\n' ' ')"
+          }
+
+          update_os_pins "src/Dockerfile"        "apt" "$VERIFIED_DEB"
+          update_os_pins "src/Dockerfile-alpine" "apk" "$VERIFIED_APK"
+          update_os_pins "src/Dockerfile-ubuntu" "apt" "$VERIFIED_UBU"
+
+          # The PR body lists only CVEs whose package got a new pin that passed the test
+          # build; triage auto-closes the PR by the CVE IDs in its body.
+          PINNED_OS_ITEMS=""
+          for ITEM in $FIXABLE_OS_ITEMS; do
+            PKG_AT=${ITEM#*(}; PKG_AT=${PKG_AT%%=*}
+            case "${PKG_AT#*@}" in
+              debian) NEW_PINS=$VERIFIED_DEB ;;
+              alpine) NEW_PINS=$VERIFIED_APK ;;
+              *)      NEW_PINS=$VERIFIED_UBU ;;
+            esac
+            # shellcheck disable=SC2086
+            if printf '%s\n' $NEW_PINS | awk -F'>=' -v p="${PKG_AT%@*}" '$1 == p {f = 1} END {exit !f}'; then
+              PINNED_OS_ITEMS="${PINNED_OS_ITEMS} ${ITEM}"
+            fi
+          done
 
           # Post issue comments for packages that failed multi-arch verification
           OPEN_ISSUES_PINS=$(gh issue list --repo "$REPO" --label security \
@@ -481,7 +672,7 @@ jobs:
             ISSUE_NUM=$(echo "$OPEN_ISSUES_PINS" | jq -r --arg cve "$FAIL_CVE" \
               '.[] | select(.title | contains($cve)) | .number' | head -1)
             [ -z "$ISSUE_NUM" ] && continue
-            COMMENT=$(printf '**Auto-fix blocked for `%s`:** package not available on all target platforms (`%s`) — pin skipped for this image variant.\n```\n%s\n```' \
+            COMMENT=$(printf '**Auto-fix blocked for `%s`:** the test build did not pass on all target platforms (`%s`) — pin skipped for this image variant.\n```\n%s\n```' \
               "$FAIL_PKG" "$FAIL_PLATFORMS" "$FAIL_MSG")
             GH_TOKEN="$GH_ISSUE_TOKEN" gh issue comment "$ISSUE_NUM" --repo "$REPO" --body "$COMMENT"
           done
@@ -531,7 +722,7 @@ jobs:
           # Only create a PR if there are actual Dockerfile changes
           git add src/Dockerfile src/Dockerfile-alpine src/Dockerfile-ubuntu
           if git diff --cached --quiet; then
-            echo "No Dockerfile changes to commit — skipping PR."
+            echo "No Dockerfile changes to commit${SCAN_NOTE} — skipping PR."
             exit 0
           fi
 
@@ -553,7 +744,7 @@ jobs:
               fi
             done
             if [ "$identical" = true ]; then
-              echo "Open security PR #${existing} already proposes these exact changes — skipping."
+              echo "Open security PR #${existing} already proposes these exact changes${SCAN_NOTE} — skipping."
               exit 0
             fi
           done
@@ -581,15 +772,19 @@ jobs:
             printf '\n**lego transitive CVEs (gobinary):** %s\n' \
               "$LEGO_NOTE" >> "$PR_BODY_FILE"
           fi
-          if [ -n "$FIXABLE_OS_ITEMS" ]; then
+          if [ -n "$PINNED_OS_ITEMS" ]; then
             printf '\n**OS package CVEs pinned:**\n' >> "$PR_BODY_FILE"
-            printf '%s\n' $FIXABLE_OS_ITEMS \
+            printf '%s\n' $PINNED_OS_ITEMS \
               | sed 's/\([^(]*\)(\([^@]*\)@\([^=]*\)=\(.*\))/- `\1` — \2 (\3) → `\4`/' \
               >> "$PR_BODY_FILE"
           fi
           if $NEEDS_CLEANUP; then
-            printf '\n**Stale OS package pins removed:** base image update resolved the CVE natively — hardcoded version pins are no longer needed.\n' \
+            printf '\n**Stale OS package pins removed:** base image update resolved the CVE natively — the minimum-version pins are no longer needed.\n' \
               >> "$PR_BODY_FILE"
+          fi
+          if [ -n "$INCOMPLETE_SCANS" ]; then
+            printf '\n**Scans that did not complete:**%s — CVEs of those images are not covered here.\n' \
+              "$INCOMPLETE_SCANS" >> "$PR_BODY_FILE"
           fi
           gh pr create \
             --title "fix: auto-fix CVEs from vulnerability scan (${TODAY})" \

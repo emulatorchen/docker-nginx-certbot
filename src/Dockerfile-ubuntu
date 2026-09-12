@@ -75,6 +75,10 @@ RUN chmod +x -R /scripts
 # Create a volume to have persistent storage for the obtained certificates.
 VOLUME /etc/letsencrypt
 
+# Applies and checks what the .trivyignore entries rely on; kept last so it also
+# covers packages installed by earlier layers, including the CVE pin block.
+RUN /scripts/cve_mitigations.sh ubuntu
+
 # Expose both ports: 80 for ACME HTTP-01 challenges, 443 for HTTPS.
 EXPOSE 80 443
 
