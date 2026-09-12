@@ -307,8 +307,7 @@ jobs:
 
             # OS package CVEs (class: os-pkgs) — pin a minimum version in the Dockerfile.
             # Trivy's fixed version is the Debian source version (or the apk version).
-            # No COVERED_CVES dedup: OS_FIXES_* must always reflect the full current
-            # scan state so stale pins are removed when a base image ships the fix.
+            # These are new fixes only: update_os_pins re-checks the pins already there.
             while IFS=$'\t' read -r CVE_ID PKG FIXED; do
               [ -z "$CVE_ID" ] && continue
               case "$PKG" in nginx*|lego*) continue ;; esac
@@ -350,19 +349,17 @@ jobs:
             ' "trivy-${VARIANT}.json" | sort -u)
           done
 
-          # Detect whether existing pin blocks need cleanup (CVE resolved in base image).
-          # Checked here so we know to proceed even when no *new* CVEs are found.
+          # The scan above ran on images that already have the current pins, so a pin that
+          # fixed its CVE is invisible to it. update_os_pins re-checks existing pins against
+          # an image built without them and sets NEEDS_CLEANUP when one is dropped.
           NEEDS_CLEANUP=false
-          [ -z "$OS_FIXES_DEB" ] && \
-            grep -q "CVE security pins" src/Dockerfile 2>/dev/null && NEEDS_CLEANUP=true
-          [ -z "$OS_FIXES_APK" ] && \
-            grep -q "CVE security pins" src/Dockerfile-alpine 2>/dev/null && NEEDS_CLEANUP=true
-          [ -z "$OS_FIXES_UBU" ] && \
-            grep -q "CVE security pins" src/Dockerfile-ubuntu 2>/dev/null && NEEDS_CLEANUP=true
+          HAS_PINS=false
+          grep -q "CVE security pins" src/Dockerfile src/Dockerfile-alpine src/Dockerfile-ubuntu \
+            2>/dev/null && HAS_PINS=true
 
           if [ -z "$FIXABLE_NGINX" ] && [ -z "$FIXABLE_LEGO" ] && \
              [ -z "$FIXABLE_OS_ITEMS" ] && [ -z "$LEGO_TRANSITIVE_CVES" ] && \
-             ! $NEEDS_CLEANUP; then
+             ! $HAS_PINS; then
             echo "No auto-fixable CVEs found — no PR created."
             exit 0
           fi
@@ -392,7 +389,7 @@ jobs:
             fi
             local PKGS_FILE
             PKGS_FILE=$(mktemp)
-            echo "$FIXES" | tr ' ' '\n' | grep -v '^$' | sort -u > "$PKGS_FILE"
+            echo "$FIXES" | tr ' ' '\n' | grep -v '^$' | LC_ALL=C sort -u > "$PKGS_FILE"
             strip_os_pins "$DOCKERFILE" > "${DOCKERFILE}.tmp"
             if [ "$PM" = "apt" ]; then
               awk -v pf="$PKGS_FILE" '
@@ -509,9 +506,121 @@ jobs:
           VERIFIED_APK=$(verify_and_filter_pins "src/Dockerfile-alpine" "apk" "$OS_FIXES_APK" "$OS_CVE_MAP_APK" "$FAIL_DIR")
           VERIFIED_UBU=$(verify_and_filter_pins "src/Dockerfile-ubuntu" "apt" "$OS_FIXES_UBU" "$OS_CVE_MAP_UBU" "$FAIL_DIR")
 
-          write_os_pins "src/Dockerfile"        "apt" "$VERIFIED_DEB"
-          write_os_pins "src/Dockerfile-alpine" "apk" "$VERIFIED_APK"
-          write_os_pins "src/Dockerfile-ubuntu" "apt" "$VERIFIED_UBU"
+          # The CVE pin block a Dockerfile carries, markers included.
+          os_pins_block() {
+            awk '/# --- CVE security pins \(auto-managed\)/, /# --- end CVE security pins ---/' "$1"
+          }
+
+          # Pins currently in a Dockerfile's block, one per line (pkg>=ver).
+          current_pins() {
+            os_pins_block "$1" | grep -oE "'[^' ]+>=[^' ]+'" | tr -d "'" | sort -u || true
+          }
+
+          # check_os_pins <dockerfile> <apt|apk>: stop when the block is not the one write_os_pins
+          # writes back from the pins current_pins can read — an older pin format, a hand edit —
+          # because rewriting it would drop whatever could not be read. Change the block layout
+          # in write_os_pins and in the Dockerfiles in the same commit.
+          check_os_pins() {
+            local DOCKERFILE="$1" PM="$2" COPY BLOCK_DIFF DIFF_RC=0 AFTER
+            grep -q "CVE security pins" "$DOCKERFILE" 2>/dev/null || return 0
+            COPY=$(mktemp)
+            cp "$DOCKERFILE" "$COPY"
+            write_os_pins "$COPY" "$PM" "$(current_pins "$DOCKERFILE" | tr '\n' ' ')"
+            BLOCK_DIFF=$(diff <(os_pins_block "$DOCKERFILE") <(os_pins_block "$COPY")) || DIFF_RC=$?
+            rm -f "$COPY"
+            if [ "$DIFF_RC" -gt 1 ]; then
+              echo "::error::${DOCKERFILE}: the CVE pin block could not be compared with the one this job writes (diff exited ${DIFF_RC})."
+              exit 1
+            fi
+            if [ -n "$BLOCK_DIFF" ]; then
+              echo "::error::${DOCKERFILE}: the CVE pin block is not the one this job writes from the pins it can read, so rewriting it would drop pins; the difference is in the log below."
+              echo "$BLOCK_DIFF"
+              exit 1
+            fi
+            # write_os_pins inserts the block ahead of every VOLUME line, so a block that is not
+            # in front of one would be moved by a rewrite; blank and comment lines may sit between.
+            AFTER=$(awk '/# --- end CVE security pins ---/ {f = 1; next}
+                         f && NF && $0 !~ /^[[:space:]]*#/ {print; exit}' "$DOCKERFILE")
+            case "$AFTER" in
+              VOLUME*) ;;
+              *)
+                echo "::error::${DOCKERFILE}: the instruction after the CVE pin block is '${AFTER:-none}', not VOLUME, so a rewrite would move the block; put it in front of VOLUME or change write_os_pins."
+                exit 1
+                ;;
+            esac
+          }
+
+          # keep_needed_pins <dockerfile> <apt|apk>: print the pins that an image built without
+          # the block still needs: that image's version is below the pinned minimum, or apt
+          # would still upgrade the package (apk keeps an installed version that meets it).
+          # Keeps every pin when that image cannot be built or fully inspected.
+          keep_needed_pins() {
+            local DOCKERFILE="$1" PM="$2" PINS OUT PROBE
+            PINS=$(current_pins "$DOCKERFILE")
+            [ -z "$PINS" ] && return 0
+            PROBE=$(mktemp)
+            cat > "$PROBE" <<'EOF'
+          pm=$1; shift
+          if [ "$pm" = apt ]; then
+            upd=$(apt-get update -qq 2>&1) && [ -z "$upd" ] || exit 1
+          fi
+          for pin; do
+            pkg=${pin%%>=*}; min=${pin#*>=}
+            if [ "$pm" = apt ]; then
+              v=$(dpkg-query -W -f='${source:Version}' "$pkg" 2>/dev/null) || { echo "drop $pin"; continue; }
+              inst=$(dpkg-query -W -f='${Version}' "$pkg")
+              cand=$(apt-cache policy "$pkg" | awk '$1 == "Candidate:" {print $2}')
+              if dpkg --compare-versions "$v" lt "$min" || dpkg --compare-versions "$inst" lt "$cand" 2>/dev/null; then
+                echo "keep $pin"
+              else
+                echo "drop $pin"
+              fi
+            else
+              v=$(apk list -I 2>/dev/null | awk -v p="$pkg" '{n = $1; sub(/-[^-]*-r[0-9]+$/, "", n); if (n == p) {print substr($1, length(p) + 2); exit}}')
+              if [ -z "$v" ]; then echo "drop $pin"
+              elif [ "$(apk version -t "$v" "$min")" = "<" ]; then echo "keep $pin"
+              else echo "drop $pin"; fi
+            fi
+          done
+          echo done
+          EOF
+            strip_os_pins "$DOCKERFILE" > "${DOCKERFILE}.unpinned"
+            # shellcheck disable=SC2086
+            if docker buildx build --platform linux/amd64 --load -t cve-unpinned \
+                 -f "${DOCKERFILE}.unpinned" "$(dirname "$DOCKERFILE")" > /dev/null 2>&1 \
+               && OUT=$(docker run --rm -i --entrypoint sh cve-unpinned -s "$PM" $PINS < "$PROBE") \
+               && [ "$(echo "$OUT" | tail -1)" = "done" ]; then
+              echo "$OUT" | sed -n 's/^keep //p'
+            else
+              echo "::warning::could not re-check the CVE pins in ${DOCKERFILE}; keeping all of them" >&2
+              echo "$PINS"
+            fi
+            rm -f "${DOCKERFILE}.unpinned" "$PROBE"
+          }
+
+          # merge_pins <kept> <new>: a new pin replaces a kept pin for the same package.
+          merge_pins() {
+            # shellcheck disable=SC2086
+            printf '%s\n' $1 | awk -v new="$2" '
+              BEGIN { n = split(new, a, " "); for (i = 1; i <= n; i++) { split(a[i], b, ">="); replaced[b[1]] = 1 } }
+              $0 != "" { split($0, c, ">="); if (!(c[1] in replaced)) print }
+              END { for (i = 1; i <= n; i++) print a[i] }'
+          }
+
+          # update_os_pins <dockerfile> <apt|apk> <verified new pins>: rewrite the block from the
+          # pins still needed plus the new ones; sets NEEDS_CLEANUP when a pin is dropped.
+          update_os_pins() {
+            local DOCKERFILE="$1" PM="$2" NEW="$3" KEPT BEFORE
+            check_os_pins "$DOCKERFILE" "$PM"
+            BEFORE=$(current_pins "$DOCKERFILE" | grep -c . || true)
+            KEPT=$(keep_needed_pins "$DOCKERFILE" "$PM")
+            if [ "$(echo "$KEPT" | grep -c . || true)" -lt "$BEFORE" ]; then NEEDS_CLEANUP=true; fi
+            write_os_pins "$DOCKERFILE" "$PM" "$(merge_pins "$KEPT" "$NEW" | tr '\n' ' ')"
+          }
+
+          update_os_pins "src/Dockerfile"        "apt" "$VERIFIED_DEB"
+          update_os_pins "src/Dockerfile-alpine" "apk" "$VERIFIED_APK"
+          update_os_pins "src/Dockerfile-ubuntu" "apt" "$VERIFIED_UBU"
 
           # Post issue comments for packages that failed multi-arch verification
           OPEN_ISSUES_PINS=$(gh issue list --repo "$REPO" --label security \
