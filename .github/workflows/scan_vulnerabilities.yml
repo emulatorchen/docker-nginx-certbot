@@ -7,13 +7,14 @@ on:
 
 permissions:
   contents: read
-  security-events: write
-  issues: write
 
 jobs:
   scan:
     name: "Scan ${{ matrix.variant }} image"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +79,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       issues: write
       pull-requests: write
     steps:
@@ -239,6 +241,9 @@ jobs:
     needs: triage
     if: always() && needs.triage.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
