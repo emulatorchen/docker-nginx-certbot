@@ -99,9 +99,21 @@ jobs:
         run: |
           TODAY=$(date +%Y-%m-%d)
 
+          # A variant whose scan failed has no JSON, or an incomplete one, and "not detected"
+          # would then mean "not scanned": close nothing, but still triage what was scanned.
+          SCANNED=""
+          MISSING=false
+          for VARIANT in debian alpine ubuntu; do
+            if jq -e .SchemaVersion "trivy-${VARIANT}.json" > /dev/null 2>&1; then
+              SCANNED="${SCANNED} ${VARIANT}"
+            else
+              echo "::error::trivy-${VARIANT}.json is missing or incomplete (the ${VARIANT} scan failed); not closing any issue or PR."
+              MISSING=true
+            fi
+          done
+
           # Collect all unique CRITICAL/HIGH CVE IDs across all three images using jq
-          ALL_CVES=$(for VARIANT in debian alpine ubuntu; do
-            [ -f "trivy-${VARIANT}.json" ] || continue
+          ALL_CVES=$(for VARIANT in $SCANNED; do
             jq -r '.Results[]?.Vulnerabilities[]? |
               select(.Severity == "CRITICAL" or .Severity == "HIGH") |
               .VulnerabilityID' "trivy-${VARIANT}.json"
@@ -113,35 +125,37 @@ jobs:
           OPEN_PRS=$(gh pr list --repo "$REPO" --label security \
             --state open --json number,body --limit 100 2>/dev/null || echo "[]")
 
-          # Close issues for CVEs no longer detected
-          echo "$OPEN_ISSUES" | jq -r '.[].title' | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u | \
-          while read -r CVE_ID; do
-            [ -z "$CVE_ID" ] && continue
-            echo "$ALL_CVES" | grep -qx "$CVE_ID" && continue
-            ISSUE_NUM=$(echo "$OPEN_ISSUES" | jq -r --arg cve "$CVE_ID" \
-              '.[] | select(.title | contains($cve)) | .number' | head -1)
-            if [ -n "$ISSUE_NUM" ]; then
-              gh issue close "$ISSUE_NUM" --repo "$REPO" \
-                --comment "Resolved — ${CVE_ID} no longer detected in weekly scan (${TODAY})."
-            fi
-          done
+          if ! $MISSING; then
+            # Close issues for CVEs no longer detected
+            echo "$OPEN_ISSUES" | jq -r '.[].title' | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u | \
+            while read -r CVE_ID; do
+              [ -z "$CVE_ID" ] && continue
+              echo "$ALL_CVES" | grep -qx "$CVE_ID" && continue
+              ISSUE_NUM=$(echo "$OPEN_ISSUES" | jq -r --arg cve "$CVE_ID" \
+                '.[] | select(.title | contains($cve)) | .number' | head -1)
+              if [ -n "$ISSUE_NUM" ]; then
+                gh issue close "$ISSUE_NUM" --repo "$REPO" \
+                  --comment "Resolved — ${CVE_ID} no longer detected in weekly scan (${TODAY})."
+              fi
+            done
 
-          # Close auto-fix PRs where all CVEs in the PR body are resolved
-          echo "$OPEN_PRS" | jq -c '.[]' | while read -r PR_JSON; do
-            PR_NUM=$(echo "$PR_JSON" | jq -r '.number')
-            PR_BODY=$(echo "$PR_JSON" | jq -r '.body // ""')
-            PR_CVES=$(echo "$PR_BODY" | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u)
-            [ -z "$PR_CVES" ] && continue
-            ALL_RESOLVED=true
-            while read -r PR_CVE; do
-              [ -z "$PR_CVE" ] && continue
-              echo "$ALL_CVES" | grep -qx "$PR_CVE" && { ALL_RESOLVED=false; break; }
-            done <<< "$PR_CVES"
-            if [ "$ALL_RESOLVED" = true ]; then
-              gh pr close "$PR_NUM" --repo "$REPO" \
-                --comment "All CVEs in this PR are resolved — closing automatically (${TODAY})."
-            fi
-          done
+            # Close auto-fix PRs where all CVEs in the PR body are resolved
+            echo "$OPEN_PRS" | jq -c '.[]' | while read -r PR_JSON; do
+              PR_NUM=$(echo "$PR_JSON" | jq -r '.number')
+              PR_BODY=$(echo "$PR_JSON" | jq -r '.body // ""')
+              PR_CVES=$(echo "$PR_BODY" | grep -oE 'CVE-[0-9]+-[0-9]+' | sort -u)
+              [ -z "$PR_CVES" ] && continue
+              ALL_RESOLVED=true
+              while read -r PR_CVE; do
+                [ -z "$PR_CVE" ] && continue
+                echo "$ALL_CVES" | grep -qx "$PR_CVE" && { ALL_RESOLVED=false; break; }
+              done <<< "$PR_CVES"
+              if [ "$ALL_RESOLVED" = true ]; then
+                gh pr close "$PR_NUM" --repo "$REPO" \
+                  --comment "All CVEs in this PR are resolved — closing automatically (${TODAY})."
+              fi
+            done
+          fi
 
           if [ -z "$ALL_CVES" ]; then
             echo "No CRITICAL/HIGH CVEs found across all images."
@@ -163,8 +177,7 @@ jobs:
             LAST_FIXED=""
             FIRST_FIXED=true
 
-            for VARIANT in debian alpine ubuntu; do
-              [ -f "trivy-${VARIANT}.json" ] || continue
+            for VARIANT in $SCANNED; do
               ROW=$(jq -r --arg cve "$CVE_ID" '
                 .Results[]?.Vulnerabilities[]? |
                 select(.VulnerabilityID == $cve and (.Severity == "CRITICAL" or .Severity == "HIGH")) |
@@ -284,9 +297,14 @@ jobs:
           OS_CVE_MAP_APK=""
           OS_CVE_MAP_UBU=""
           LEGO_TRANSITIVE_CVES=""
+          INCOMPLETE_SCANS=""
 
           for VARIANT in debian alpine ubuntu; do
-            [ -f "trivy-${VARIANT}.json" ] || continue
+            if ! jq -e .SchemaVersion "trivy-${VARIANT}.json" > /dev/null 2>&1; then
+              echo "::warning::trivy-${VARIANT}.json is missing or incomplete (the ${VARIANT} scan failed); no fixes from it this run."
+              INCOMPLETE_SCANS="${INCOMPLETE_SCANS} ${VARIANT}"
+              continue
+            fi
 
             # nginx / lego direct CVEs
             while IFS=$'\t' read -r CVE_ID PKG FIXED; do
@@ -349,6 +367,8 @@ jobs:
             ' "trivy-${VARIANT}.json" | sort -u)
           done
 
+          SCAN_NOTE="${INCOMPLETE_SCANS:+ (missing or incomplete scans:${INCOMPLETE_SCANS})}"
+
           # The scan above ran on images that already have the current pins, so a pin that
           # fixed its CVE is invisible to it. update_os_pins re-checks existing pins against
           # an image built without them and sets NEEDS_CLEANUP when one is dropped.
@@ -360,7 +380,7 @@ jobs:
           if [ -z "$FIXABLE_NGINX" ] && [ -z "$FIXABLE_LEGO" ] && \
              [ -z "$FIXABLE_OS_ITEMS" ] && [ -z "$LEGO_TRANSITIVE_CVES" ] && \
              ! $HAS_PINS; then
-            echo "No auto-fixable CVEs found — no PR created."
+            echo "No auto-fixable CVEs found${SCAN_NOTE} — no PR created."
             exit 0
           fi
 
@@ -686,7 +706,7 @@ jobs:
           # Only create a PR if there are actual Dockerfile changes
           git add src/Dockerfile src/Dockerfile-alpine src/Dockerfile-ubuntu
           if git diff --cached --quiet; then
-            echo "No Dockerfile changes to commit — skipping PR."
+            echo "No Dockerfile changes to commit${SCAN_NOTE} — skipping PR."
             exit 0
           fi
 
@@ -708,7 +728,7 @@ jobs:
               fi
             done
             if [ "$identical" = true ]; then
-              echo "Open security PR #${existing} already proposes these exact changes — skipping."
+              echo "Open security PR #${existing} already proposes these exact changes${SCAN_NOTE} — skipping."
               exit 0
             fi
           done
@@ -745,6 +765,10 @@ jobs:
           if $NEEDS_CLEANUP; then
             printf '\n**Stale OS package pins removed:** base image update resolved the CVE natively — the minimum-version pins are no longer needed.\n' \
               >> "$PR_BODY_FILE"
+          fi
+          if [ -n "$INCOMPLETE_SCANS" ]; then
+            printf '\n**Scans that did not complete:**%s — CVEs of those images are not covered here.\n' \
+              "$INCOMPLETE_SCANS" >> "$PR_BODY_FILE"
           fi
           gh pr create \
             --title "fix: auto-fix CVEs from vulnerability scan (${TODAY})" \
